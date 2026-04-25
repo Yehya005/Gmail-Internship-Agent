@@ -1,0 +1,14 @@
+# Browser automation — controls a Chromium window to interact with Gmail
+playwright==1.58.0
+
+# ---------------------------------------------------------------
+# IMPORTANT: Install using python -m pip (not bare pip) to ensure
+# packages land in the same Python that runs the scripts:
+#
+#   python -m pip install -r requirements.txt
+#   python -m playwright install chromium
+#
+# Playwright's Chromium binary is stored at:
+#   ~\AppData\Local\ms-playwright\
+# and is shared across Python versions — only needed once.
+# ---------------------------------------------------------------

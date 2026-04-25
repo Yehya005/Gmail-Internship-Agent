@@ -1,0 +1,25 @@
+# Project-local Python virtualenv
+venv/
+
+# Project-local Playwright browsers download (PLAYWRIGHT_BROWSERS_PATH)
+browsers/
+
+# Runtime IPC + log artifacts
+emails.json
+to_label.json
+agent_output.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code project state (user-local)
+.claude/

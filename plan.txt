@@ -1,0 +1,38 @@
+This project is a requirment for one of my courses. The exact requirments are stored under: LLMIntern\Requirments
+In this project, we will be building an agent that will monitor my gmail inbox and filter emails that provide internship opportunities that match my skills. My skils are summurized in the following points:
+
+# User Profile — Replace this with your actual CV content
+
+
+Degree: Computer Engineering
+University: Lebanese American University (LAU)
+Year: Senior
+
+Skills:
+- Python, C, VHDL, SQL, JavaScript
+- Deep Learning, Machine Learning, NLP
+- TensorFlow, PyTorch, Keras
+- Flask, React, Streamlit
+- Git, Linux, Docker
+
+Interests:
+- Artificial Intelligence and Deep Learning
+- Embedded Systems and Digital Design
+- Software Engineering
+- Research in Brain-Computer Interfaces (EEG)
+- Drug-Target Interaction (DTI) prediction
+
+Preferred Internship Types:
+- AI/ML Engineering Intern
+- Research Intern (AI, Neuroscience, Bioinformatics)
+- Software Engineering Intern
+- Embedded Systems Intern
+
+Languages: English (fluent), Arabic (native)
+
+Past Projects:
+- ECG Arrhythmia Detection using CNN + Transformer (Deep Learning)
+- CPU Simulator with pipeline visualization (Flask + Python)
+- Dream Journaling App with OpenAI integration (Full-stack)
+- EEG Seizure Detection Research (ongoing)
+- HCS12 Assembly Elevator Control System
