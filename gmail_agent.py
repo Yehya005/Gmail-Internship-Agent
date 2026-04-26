@@ -205,14 +205,36 @@ async def _verify_labels(page: Page) -> list[str]:
 
 # ── Cycle steps ─────────────────────────────────────────────────────────────
 
-async def _run_read(page: Page, cycle_seconds: int) -> list[dict]:
-    """Step 1: read fresh emails. On exception, log + return partial set
-    so step 2/3 can still run on whatever made it through."""
+async def _run_read(
+    page: Page, cycle_seconds: int, seen: set[str],
+) -> list[dict]:
+    """Step 1: read fresh emails the agent hasn't processed yet. On
+    exception, log + return partial set so step 2/3 can still run on
+    whatever made it through."""
     try:
-        return await read_emails.read(page, cycle_seconds=cycle_seconds)
+        return await read_emails.read(
+            page, cycle_seconds=cycle_seconds, seen_thread_ids=seen,
+        )
     except Exception as e:
         print(f"  [read] step failed: {e}")
         return []
+
+
+def _load_seen() -> set[str]:
+    """Populate the seen-set from history.jsonl so a restart doesn't
+    re-process emails the agent has already handled in a prior session."""
+    seen: set[str] = set()
+    if not HISTORY_FILE.exists():
+        return seen
+    for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            seen.add(json.loads(line)["thread_id"])
+        except Exception:
+            continue
+    return seen
 
 
 def _run_classify(emails: list[dict]) -> dict[str, list[str]]:
@@ -292,13 +314,19 @@ async def main() -> None:
 
         # ── Monitoring loop ─────────────────────────────────────────────────
         print(f"[4/4] Starting monitoring loop (every {args.interval:g} min).\n")
+        # Seen-set: every thread_id we've already processed. Persisted via
+        # history.jsonl so restarts don't re-handle past emails. Updated
+        # in-memory at the end of each successful cycle.
+        seen = _load_seen()
+        if seen:
+            print(f"  Loaded {len(seen)} already-processed thread(s) from history.jsonl.\n")
         cycle = 1
         while True:
             print("-" * 50)
             print(f"Cycle {cycle} — {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # Step 1: read
-            emails = await _run_read(page, cycle_seconds)
+            # Step 1: read (skips thread_ids in `seen`)
+            emails = await _run_read(page, cycle_seconds, seen)
 
             if not emails:
                 print("  No new emails this cycle.")
@@ -314,8 +342,10 @@ async def main() -> None:
                     )
                     print(f"  [LABELED {','.join(labels)}] {subject[:50]}")
                 print(f"  Applied {applied}/{requested} (thread, label) pair(s).")
-                # Step 4: history
+                # Step 4: history + seen tracking
                 _append_history(emails, thread_labels)
+                for e in emails:
+                    seen.add(e["thread_id"])
 
             cycle += 1
             print(f"\nSleeping {args.interval:g} min until next cycle...")

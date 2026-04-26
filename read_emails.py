@@ -133,10 +133,22 @@ async def read(
     cycle_seconds: int,
     safe_zone_seconds: int = 60,
     max_emails: int = EMAILS_PER_CYCLE,
+    seen_thread_ids: set[str] | None = None,
 ) -> list[dict]:
-    """Scan inbox → recency-filter → open + scrape full body of each fresh
-    email. Returns whatever succeeded; failures are logged and skipped
-    so the next pipeline step can still run on the partial set."""
+    """Scan inbox → recency-filter → drop already-processed thread_ids →
+    open + scrape full body of each remaining email.
+
+    The `seen_thread_ids` set lets the orchestrator dedupe across cycles
+    so an email that lands inside the recency window in two consecutive
+    cycles (the 60-s safe zone makes this possible) isn't re-opened or
+    re-classified. The body-scrape navigation is the most expensive
+    step in a cycle, so deduping BEFORE that loop is what matters.
+
+    Returns whatever succeeded; per-email failures are logged and
+    skipped so the next pipeline step can still run on the partial set.
+    """
+    seen: set[str] = seen_thread_ids if seen_thread_ids is not None else set()
+
     await page.goto("https://mail.google.com/#inbox", wait_until="domcontentloaded")
     try:
         await page.wait_for_selector("tr.zA", timeout=15_000)
@@ -155,8 +167,13 @@ async def read(
         and r["received_ms"] >= cutoff_ms
     ]
 
+    new = [r for r in fresh if r["thread_id"] not in seen]
+    skipped = len(fresh) - len(new)
+    if skipped:
+        print(f"    [read] skipped {skipped} already-processed thread(s)")
+
     out: list[dict] = []
-    for r in fresh:
+    for r in new:
         try:
             body = await _open_and_get_full_body(page, r["thread_id"])
         except Exception as e:
