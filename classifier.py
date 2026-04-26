@@ -27,12 +27,7 @@ import json
 import sys
 from pathlib import Path
 
-from cv_match import (
-    _CHUNK_TOPIC_RULES,
-    covered_topics,
-    get_matcher,
-    match_dict as cv_match_dict,
-)
+from cv_match import _CHUNK_TOPIC_RULES, match_dict as cv_match_dict
 from scam_scorer import score_email_dict
 
 SCAM_THRESHOLD = 0.5
@@ -42,14 +37,6 @@ HIGH_SIM_THRESHOLD = 0.50    # at/above this, RAG signal is strong enough to
                              # bypass the body-keyword confirmation step —
                              # multiple high-scoring chunks for different
                              # topics will multi-label even on terse bodies
-
-
-def _uncovered_topics() -> set[str]:
-    """Topics that no project chunk in the CV covers — these need the
-    body-keyword fallback rather than the RAG-vote path."""
-    m = get_matcher()
-    all_topics = set(_CHUNK_TOPIC_RULES.keys())
-    return all_topics - covered_topics(m.chunks)
 
 
 def classify_email(email: dict) -> list[str]:
@@ -102,10 +89,20 @@ def classify_email(email: dict) -> list[str]:
             if any(kw in text for kw in keywords):
                 labels.add(topic)
 
-    # 6. Uncovered-topic fallback: topics that no project covers (e.g.
-    #    DevOps in this CV) are detected via the same body keywords.
-    for topic in _uncovered_topics():
-        keywords = _CHUNK_TOPIC_RULES.get(topic, [])
+    # 6. Body-keyword safety net: for any topic NOT already emitted, add
+    #    it if the body explicitly names it. Catches two cases:
+    #    - Topics not covered by any CV project (DevOps here) — there's
+    #      no chunk that could vote, so keywords are the only signal.
+    #    - Topics whose project chunk scored just below threshold even
+    #      though the email mentions the topic (e.g. EEG Seizure
+    #      Detection at sim 0.26 for a 'research using deep learning'
+    #      email — ECG dominates retrieval but Research is in the body).
+    #    The CV_MATCH_THRESHOLD gate above already confirmed the email
+    #    is tech-relevant for this candidate, so the keyword fallback
+    #    won't fire on off-topic emails like marketing pitches.
+    for topic, keywords in _CHUNK_TOPIC_RULES.items():
+        if topic in labels:
+            continue
         if any(kw in text for kw in keywords):
             labels.add(topic)
 
