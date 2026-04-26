@@ -72,6 +72,9 @@ CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 EMAILS_FILE = Path("emails.json")
 TO_LABEL_FILE = Path("to_label.json")
+# Append-only log of every cycle's emails + their applied labels. Streamlit
+# UI reads this file to render the dashboard.
+HISTORY_FILE = Path("history.jsonl")
 
 
 # ── Browser launch ───────────────────────────────────────────────────────────
@@ -621,6 +624,17 @@ async def main() -> None:
                     print(f"  [LABELED {','.join(labels)}] {subject[:50]}")
 
                 print(f"\nApplied {applied}/{requested} (thread, label) pair(s).")
+
+                # Append every email this cycle to history.jsonl so the
+                # Streamlit UI has a complete record. Includes the labels
+                # actually applied (empty list for emails we skipped).
+                cycle_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                with HISTORY_FILE.open("a", encoding="utf-8") as f:
+                    for e in new_emails:
+                        record = dict(e)
+                        record["labels_applied"] = thread_labels.get(e["thread_id"], [])
+                        record["cycle_at"] = cycle_at
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             cycle += 1
             print(f"\nSleeping {CYCLE_INTERVAL_SECONDS / 60:g} min until next cycle...")

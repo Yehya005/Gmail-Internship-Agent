@@ -59,11 +59,18 @@ venv\Scripts\python -u gmail_agent.py
 
 # Custom cycle length, e.g. 2 minutes:
 venv\Scripts\python -u gmail_agent.py --interval 2
+
+# Start the dashboard in a SECOND terminal (default URL: http://localhost:8501)
+venv\Scripts\python -m streamlit run streamlit_app.py
 ```
 
 `--interval` is in minutes (float, default 2). Both the recency-window
 and the inter-cycle sleep use this value, and the IPC wait is half the
-cycle so a tight cadence can't hang on Claude Code analysis.
+cycle (min 90 s) so a tight cadence can't hang on Claude Code analysis.
+
+The dashboard reads `history.jsonl`, which the agent appends to after
+every cycle. Each record carries the email, scam-risk score with reasons,
+CV-match score with retrieved evidence, and the labels actually applied.
 
 Run in background with Claude Code and monitor output with `tail -f <output_file>`.
 

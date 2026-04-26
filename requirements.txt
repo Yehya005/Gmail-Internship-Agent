@@ -6,6 +6,9 @@ playwright==1.58.0
 sentence-transformers>=3.0
 numpy>=1.26
 
+# UI — dashboard reads history.jsonl produced by gmail_agent.py.
+streamlit>=1.40
+
 # ---------------------------------------------------------------
 # IMPORTANT: Install using python -m pip (not bare pip) to ensure
 # packages land in the same Python that runs the scripts:

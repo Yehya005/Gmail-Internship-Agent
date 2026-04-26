@@ -10,6 +10,9 @@ to_label.json
 agent_output.log
 *.log
 
+# Per-cycle history fed into the Streamlit dashboard (real email content)
+history.jsonl
+
 # Python
 __pycache__/
 *.pyc
