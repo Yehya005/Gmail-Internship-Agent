@@ -75,19 +75,22 @@ def agent_status() -> tuple[bool, int | None]:
 
 
 def start_agent(interval_min: float) -> int:
-    """Spawn gmail_agent.py in the background. Returns the new PID."""
-    # Append to the same log the standalone runs use.
+    """Spawn gmail_agent.py in the background. Returns the new PID.
+
+    NOTE: do NOT pass creationflags=CREATE_NEW_PROCESS_GROUP or
+    close_fds=True on Windows. Both interfere with Playwright's
+    Node-driver pipes and the agent crashes with EPIPE before it can
+    even print '[1/4] Setting up Chrome...'. Inheriting the parent's
+    process group is fine — os.kill(pid, SIGTERM) on Windows uses
+    TerminateProcess regardless of group membership.
+    """
     log_handle = AGENT_LOG.open("a", encoding="utf-8")
-    creationflags = (
-        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    )
     proc = subprocess.Popen(
         [str(VENV_PY), "-u", "gmail_agent.py", "--interval", str(interval_min)],
         cwd=str(PROJECT),
+        stdin=subprocess.DEVNULL,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
-        creationflags=creationflags,
-        close_fds=True,
     )
     PID_FILE.write_text(str(proc.pid), encoding="utf-8")
     return proc.pid
