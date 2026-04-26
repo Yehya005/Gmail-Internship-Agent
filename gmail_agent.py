@@ -499,7 +499,7 @@ async def _wait_for_decisions() -> tuple[dict[str, list[str]], bool]:
                 return thread_labels, False
             except Exception:
                 pass
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
     return {}, True
 
 
@@ -513,6 +513,16 @@ def _parse_args() -> argparse.Namespace:
         default=2.0,
         help="Cycle length in minutes — also the email-recency window. Default: 2.",
     )
+    parser.add_argument(
+        "--ipc-wait",
+        type=int,
+        default=20,
+        help=(
+            "Seconds to wait for an external to_label.json before the local "
+            "classifier kicks in. Bump if you're driving labels with a slow "
+            "LLM in the loop. Default: 20."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -522,11 +532,12 @@ async def main() -> None:
     if args.interval <= 0:
         raise SystemExit("--interval must be positive")
     CYCLE_INTERVAL_SECONDS = int(args.interval * 60)
-    # Give Claude Code (the LLM) at least 90 s to read emails.json and write
-    # to_label.json — short cycles otherwise time out before classification
-    # finishes, especially when the email body + cv_match + scam_features
-    # all need to be read together.
-    DECISION_TIMEOUT_SECONDS = max(90, CYCLE_INTERVAL_SECONDS // 2)
+    # IPC wait — how long to wait for an external decision-maker (Claude
+    # Code, an LLM API caller, etc.) to drop to_label.json. If nobody
+    # writes the file within this window, the local classifier runs
+    # autonomously (the common dashboard-driven case). Tight default so
+    # the autonomous flow doesn't pay 90 s of dead time per cycle.
+    DECISION_TIMEOUT_SECONDS = args.ipc_wait
 
     print("=== Gmail Internship Monitor ===")
     print(f"Cycle: {args.interval:g} min  ·  IPC wait: {DECISION_TIMEOUT_SECONDS}s\n")
