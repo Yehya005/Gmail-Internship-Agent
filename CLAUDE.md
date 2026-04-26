@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Course project (COE548/748): an agent that monitors a Gmail inbox every 10 minutes, extracts emails, and labels internship opportunities that match the user's profile. Claude Code acts as the intelligence layer — no external AI API is used.
+Course project (COE548/748): an agent that monitors a Gmail inbox every few minutes, extracts emails, and labels internship opportunities that match the user's profile. Claude Code acts as the intelligence layer — no external AI API is used.
+
+**Labels (5, multi-label per email):** `AI/ML`, `Research`, `Software Engineering`, `Embedded Systems`, `DevOps`. A single internship can carry several labels (e.g., an "ML research role using Docker" gets AI/ML + Research + DevOps).
 
 **User profile:** Senior Computer Engineering student at LAU. Skills: Python, C, VHDL, SQL, JS, Deep Learning, ML, NLP, TensorFlow, PyTorch, Keras, Flask, React, Streamlit, Git, Linux, Docker. Target roles: AI/ML Engineering Intern, Research Intern (AI/Neuroscience/Bioinformatics), Software Engineering Intern, Embedded Systems Intern.
 
@@ -21,8 +23,12 @@ to_label.json        ← written by Claude Code: {"thread_ids": [...]}; agent ap
 **Flow per cycle:**
 1. Real Chrome (no profile) opens at gmail.com via subprocess + CDP
 2. User logs in manually
-3. "Internship Match" label created if it doesn't exist
-4. Every 2 min (default; configurable via `--interval`): scan inbox → keep only emails **received in that window** → write `emails.json` → wait for `to_label.json` → apply labels (one thread at a time, via the bulk-toolbar three-dots → "Label as" submenu)
+3. All 5 topic labels created if missing (idempotent)
+4. Every 2 min (default; configurable via `--interval`): scan inbox → keep only emails **received in that window** → write `emails.json` → wait for `to_label.json` → apply each `(thread, label)` pair via the bulk-toolbar three-dots → "Label as" submenu
+
+**IPC formats:**
+- `emails.json` — list of `{thread_id, subject, sender, body, received_ms}`
+- `to_label.json` — `{"thread_labels": {"<thread_id>": ["AI/ML", "Research", ...], ...}}`. Threads with no matching labels are simply omitted from the dict.
 
 **Recency filter:** `_scan_inbox` extracts the per-row timestamp from `td.xW span[title]` (Gmail format `"Sat, 25 Apr 2026, 16:11"`) and the main loop drops anything older than `CYCLE_INTERVAL_SECONDS`. The cycle interval matches the freshness window, so this filter alone is sufficient — no `processed_ids` cache is needed.
 
@@ -61,30 +67,29 @@ cycle so a tight cadence can't hang on Claude Code analysis.
 
 Run in background with Claude Code and monitor output with `tail -f <output_file>`.
 
-## Current Status (session 2026-04-26 — labeling rewritten)
+## Current Status (session 2026-04-26 — multi-label support)
 
 ### What works
 - Step 1: Chrome auto-connects via CDP (or launches fresh)
 - Step 2: Login detection via `[gh="cm"]` compose button
-- Step 3: "Internship Match" label creation via the sidebar `+` button,
-  then `input.type()` + Enter on the MDC default-action button.
+- Step 3: All five topic labels are created (idempotent) via the sidebar
+  `+` button, `input.type()` + Enter on the MDC default-action button.
 - Step 4a: Inbox scan — single JS pass, with per-row timestamp parsed
-  from `td.xW span[title]`. Recency filter on `received_ms`.
-- Email analysis: Claude Code reads `emails.json`, picks internship matches
-- IPC handshake: `emails.json` / `to_label.json` exchange
-- **Step 4b (new):** `_apply_labels_from_inbox` now labels each thread
-  *independently*. For each thread ID:
+  from `td.xW span[title]`. Recency filter on `received_ms` with a 60 s
+  grace to absorb Gmail's minute-only timestamp precision.
+- Email analysis: Claude Code reads `emails.json`, decides which labels
+  (zero or more) apply to each thread, writes `to_label.json` as
+  `{"thread_labels": {"<id>": [...], ...}}`.
+- **Step 4b:** `_apply_labels_from_inbox` loops over `(thread, label)`
+  pairs. For each pair:
   1. Tick the row's checkbox.
-  2. Click bulk-toolbar `[data-tooltip="More"]` (the three-dots overflow).
+  2. Click bulk-toolbar `[data-tooltip="More"]` (three-dots overflow).
   3. Hover `[role="menuitem"]:has-text("Label as")` (it's `aria-haspopup`,
      opens on hover not click).
-  4. Click `[role="menuitemcheckbox"][title="Internship Match"]` with
-     `force=True` (submenu is animating; Playwright stability times out
-     but the click reaches Gmail).
-  5. Escape twice + untick the row before moving to the next thread.
-
-  The previous bulk-flow over-labeled everything in the inbox; this
-  per-thread version was verified end-to-end on 2026-04-26.
+  4. Click `[role="menuitemcheckbox"][title="<label>"]` with `force=True`
+     (submenu animation defeats Playwright stability check, click still
+     reaches Gmail).
+  5. Escape twice + untick row before the next pair.
 - `--interval <minutes>` CLI flag — default 2.
 
 ### Known thread IDs for test internship emails

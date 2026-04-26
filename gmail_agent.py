@@ -3,15 +3,20 @@
 How it works:
   1. Launches the user's real Chrome (no profile) at gmail.com.
   2. Waits for the user to log in manually (the only manual step).
-  3. Creates the Gmail label 'Internship Match' if it doesn't exist.
+  3. Creates each topic-specific Gmail label in LABELS if missing
+     (AI/ML, Research, Software Engineering, Embedded Systems, DevOps).
   4. Every cycle (default 2 min, set via --interval):
        a. Scans the inbox and keeps only emails received in that window.
        b. Writes emails.json + prints to stdout.
        c. Waits for Claude Code to drop to_label.json.
-       d. Applies the label to threads listed in to_label.json — each
-          thread independently (tick row → bulk More → 'Label as' →
+       d. Applies each thread's chosen labels — each (thread, label)
+          pair independently (tick row → bulk More → 'Label as' →
           click the menuitemcheckbox → untick).
        e. Sleeps the cycle interval, then repeats.
+
+IPC formats:
+  emails.json   — list of {thread_id, subject, sender, body, received_ms}
+  to_label.json — {"thread_labels": {"<thread_id>": ["AI/ML", ...], ...}}
 
 IPC protocol:
   emails.json   — written by this script; Claude Code reads it to decide.
@@ -37,7 +42,15 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
-LABEL_NAME = "Internship Match"
+# Topic-specific labels. Each email can receive zero, one, or several of
+# these — Claude Code decides per-email based on the user's CV/skills.
+LABELS = [
+    "AI/ML",                # AI, ML, Deep Learning, NLP, TF/PyTorch/Keras
+    "Research",             # AI/Neuroscience/BCI/EEG/Bioinformatics/DTI roles
+    "Software Engineering", # full-stack, Flask, React, web, Python/JS
+    "Embedded Systems",     # C, VHDL, digital design, microcontrollers
+    "DevOps",               # Docker, Git, Linux, CI/CD, infra
+]
 EMAILS_PER_CYCLE = 50
 CDP_PORT = 9222
 
@@ -132,32 +145,24 @@ async def _connect_or_launch_chrome(
 
 # ── Gmail helpers ─────────────────────────────────────────────────────────────
 
-async def _label_in_sidebar(page: Page) -> bool:
-    """Quick sidebar check for an existing label entry (not a create button)."""
+async def _label_in_sidebar(page: Page, name: str) -> bool:
+    """Quick sidebar check for an existing label entry."""
     for sel in (
-        f'a[aria-label="{LABEL_NAME}"]',
-        f'.aim a[href*="label"]:has-text("{LABEL_NAME}")',
-        f'div.aio:has-text("{LABEL_NAME}")',
+        f'a[aria-label="{name}"]',
+        f'a[aria-label^="{name} "]',  # Gmail appends e.g. "1 unread has menu"
+        f'.aim a[href*="label"]:has-text("{name}")',
+        f'div.aio:has-text("{name}")',
     ):
         if await page.locator(sel).count() > 0:
             return True
     return False
 
 
-async def _create_label(page: Page) -> None:
-    """Create the label via the sidebar '+' button next to the 'Labels' heading.
-
-    The previously-attempted Settings → Labels flow is unreliable: the
-    "Create new label" link is intercepted by an invisible overlay
-    (Gmail's `uW2Fw-JD` panel container). The sidebar '+' button opens the
-    same New-label dialog with no overlay interference.
-    """
-    await page.goto("https://mail.google.com", wait_until="domcontentloaded")
-    await page.wait_for_selector('[gh="cm"]', timeout=30_000)
-    await asyncio.sleep(3)  # let sidebar finish rendering user labels
-
-    if await _label_in_sidebar(page):
-        print(f"  Label '{LABEL_NAME}' already exists.")
+async def _create_one_label(page: Page, name: str) -> None:
+    """Create a Gmail label via the sidebar '+' button. Idempotent —
+    bails out early if the label already exists in the sidebar."""
+    if await _label_in_sidebar(page, name):
+        print(f"  Label '{name}' already exists.")
         return
 
     plus_sel = '[aria-label="Create new label"][data-tooltip="Create new label"]'
@@ -165,63 +170,67 @@ async def _create_label(page: Page) -> None:
     try:
         await plus.wait_for(state="visible", timeout=10_000)
     except Exception:
-        print("  WARNING: '+' button next to 'Labels' not found in sidebar.")
+        print(f"  WARNING: '+' button not found (cannot create '{name}').")
         return
     await plus.click()
     await asyncio.sleep(1.5)
 
-    # Gmail's New-label dialog uses class `uW2Fw-JD`. The actual <input> is
-    # a Material-style textbox with no name/aria-label — selecting by type works.
     dlg = page.locator('div.uW2Fw-JD').first
     try:
         await dlg.wait_for(state="visible", timeout=5_000)
     except Exception:
-        print("  WARNING: New-label dialog did not appear.")
+        print(f"  WARNING: New-label dialog did not appear for '{name}'.")
         return
 
     # Use type() (not fill) so Material Components' input listener fires and
-    # the Create button becomes enabled. Then press Enter — the button has
-    # `data-mdc-dialog-button-default`, so Enter submits the dialog reliably
-    # even if a programmatic click is intercepted by the MDC backdrop.
+    # the Create button becomes enabled. Press Enter — the button is the MDC
+    # default-action button, so Enter submits the dialog reliably.
     inp = dlg.locator('input[type="text"]').first
     await inp.click()
-    await inp.type(LABEL_NAME, delay=40)
+    await inp.type(name, delay=40)
     await asyncio.sleep(0.4)
     await inp.press("Enter")
 
     try:
         await dlg.wait_for(state="hidden", timeout=8_000)
-        print(f"  Label '{LABEL_NAME}' creation submitted.")
+        print(f"  Label '{name}' creation submitted.")
     except Exception:
-        # Fallback: try clicking the Create button now that input has typed text
         try:
             create_btn = dlg.locator('button:has-text("Create")').first
             await create_btn.click(timeout=4_000)
             await dlg.wait_for(state="hidden", timeout=6_000)
-            print(f"  Label '{LABEL_NAME}' creation submitted (via Create click).")
+            print(f"  Label '{name}' creation submitted (via Create click).")
         except Exception:
-            print("  WARNING: Dialog did not close — creation may have failed.")
+            print(f"  WARNING: Dialog did not close for '{name}'.")
 
 
-async def _verify_label(page: Page) -> bool:
-    """Confirm the label exists. Sidebar is checked first (cheap); if not
-    visible there, fall back to the labels settings page (authoritative)."""
+async def _ensure_labels(page: Page) -> None:
+    """Create all configured labels (idempotent)."""
+    await page.goto("https://mail.google.com", wait_until="domcontentloaded")
+    await page.wait_for_selector('[gh="cm"]', timeout=30_000)
+    await asyncio.sleep(3)
+    for name in LABELS:
+        await _create_one_label(page, name)
+
+
+async def _verify_labels(page: Page) -> list[str]:
+    """Return any configured labels still missing after creation attempts."""
     await asyncio.sleep(1.5)
-    if await _label_in_sidebar(page):
-        return True
+    missing = [n for n in LABELS if not await _label_in_sidebar(page, n)]
+    if not missing:
+        return []
 
-    # Fallback: navigate to the labels settings page and search the rendered text
+    # Fallback: settings page is authoritative
     await page.goto(
         "https://mail.google.com/mail/u/0/#settings/labels",
         wait_until="domcontentloaded",
     )
     await asyncio.sleep(3)
-    found = await page.evaluate(
-        "(name) => document.body.innerText.includes(name)", LABEL_NAME
-    )
+    body_text = await page.evaluate("() => document.body.innerText")
+    still_missing = [n for n in missing if n not in body_text]
     await page.goto("https://mail.google.com", wait_until="domcontentloaded")
     await page.wait_for_selector('[gh="cm"]', timeout=30_000)
-    return bool(found)
+    return still_missing
 
 
 async def _scan_inbox(page: Page) -> list[dict]:
@@ -280,13 +289,22 @@ async def _scan_inbox(page: Page) -> list[dict]:
     return [e for e in emails if e.get("subject") or e.get("body")]
 
 
-async def _label_one_thread(page: Page, tid: str) -> bool:
-    """Apply LABEL_NAME to a single thread via:
-    tick row checkbox → bulk-toolbar More → hover 'Label as' → click the
-    `[role="menuitemcheckbox"][title=LABEL_NAME]` entry.
+_TOGGLE_ROW_CB_JS = """(idx) => {
+    const row = document.querySelectorAll('tr.zA')[idx];
+    if (!row) return false;
+    const cb = row.querySelector('.oZ-jc') ||
+               row.querySelector('[role="checkbox"]') ||
+               row.querySelector('td.PF');
+    if (cb) { cb.click(); return true; }
+    return false;
+}"""
 
-    Each thread is processed in isolation (tick / label / untick) so a failure
-    on one thread can't leave residual selection that affects the next one.
+
+async def _label_one_thread(page: Page, tid: str, label_name: str) -> bool:
+    """Apply one label to one thread via:
+    tick row checkbox → bulk-toolbar More → hover 'Label as' → click the
+    `[role="menuitemcheckbox"][title=label_name]` entry → untick row.
+    Returns True iff the click on the menuitemcheckbox completed.
     """
     row_index: int = await page.evaluate(
         """(tid) => [...document.querySelectorAll('tr.zA')].findIndex(r =>
@@ -299,18 +317,7 @@ async def _label_one_thread(page: Page, tid: str) -> bool:
         print(f"  [WARN] Thread {tid[:24]} not found in inbox view.")
         return False
 
-    def _toggle_row_cb_js() -> str:
-        return """(idx) => {
-            const row = document.querySelectorAll('tr.zA')[idx];
-            if (!row) return false;
-            const cb = row.querySelector('.oZ-jc') ||
-                       row.querySelector('[role="checkbox"]') ||
-                       row.querySelector('td.PF');
-            if (cb) { cb.click(); return true; }
-            return false;
-        }"""
-
-    if not await page.evaluate(_toggle_row_cb_js(), row_index):
+    if not await page.evaluate(_TOGGLE_ROW_CB_JS, row_index):
         return False
     await asyncio.sleep(1.5)  # bulk toolbar animates in
 
@@ -321,55 +328,59 @@ async def _label_one_thread(page: Page, tid: str) -> bool:
             '[role="menuitem"]:has-text("Label as")'
         ).first.hover(timeout=4_000)
         await asyncio.sleep(1.5)  # submenu animates open
-        # `force=True`: the submenu is animating, so Playwright's stability
-        # check times out — but the actual click still reaches Gmail.
+        # `force=True`: submenu animation defeats Playwright's stability check,
+        # but the click still reaches Gmail.
         await page.locator(
-            f'[role="menuitemcheckbox"][title="{LABEL_NAME}"]'
+            f'[role="menuitemcheckbox"][title="{label_name}"]'
         ).first.click(timeout=8_000, force=True)
         await asyncio.sleep(0.6)
         return True
     except Exception as e:
-        print(f"  [WARN] Could not label {tid[:24]}: {e}")
+        print(f"  [WARN] Could not apply '{label_name}' to {tid[:24]}: {e}")
         return False
     finally:
-        # Always close any open menu and untick the row
         try:
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.2)
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.4)
-            await page.evaluate(_toggle_row_cb_js(), row_index)
+            await page.evaluate(_TOGGLE_ROW_CB_JS, row_index)
             await asyncio.sleep(0.3)
         except Exception:
             pass
 
 
-async def _apply_labels_from_inbox(page: Page, thread_ids: list[str]) -> int:
-    """Apply LABEL_NAME to each thread in `thread_ids`. Returns the count
-    successfully labeled.
-
-    Each thread is labeled independently to avoid the previous bulk-flow bug
-    where a single Label-picker action somehow affected unrelated rows.
-    """
-    if not thread_ids:
-        return 0
+async def _apply_labels_from_inbox(
+    page: Page, thread_labels: dict[str, list[str]]
+) -> tuple[int, int]:
+    """Apply each thread's list of labels. Returns (applied_count,
+    requested_count) over all (thread, label) pairs."""
+    if not thread_labels:
+        return 0, 0
 
     await page.goto("https://mail.google.com/#inbox", wait_until="domcontentloaded")
     try:
         await page.wait_for_selector("tr.zA", timeout=15_000)
     except Exception:
-        return 0
+        return 0, sum(len(v) for v in thread_labels.values())
 
-    labeled = 0
-    for tid in thread_ids:
-        if await _label_one_thread(page, tid):
-            labeled += 1
-    return labeled
+    applied = 0
+    requested = 0
+    for tid, labels in thread_labels.items():
+        for label_name in labels:
+            requested += 1
+            if label_name not in LABELS:
+                print(f"  [WARN] Unknown label '{label_name}' — skipping.")
+                continue
+            if await _label_one_thread(page, tid, label_name):
+                applied += 1
+    return applied, requested
 
 
 # ── IPC ──────────────────────────────────────────────────────────────────────
 
-async def _wait_for_decisions() -> list[str]:
+async def _wait_for_decisions() -> dict[str, list[str]]:
+    """Read to_label.json and return {thread_id: [label_name, ...]}."""
     if DECISION_TIMEOUT_SECONDS >= 60:
         wait_str = f"{DECISION_TIMEOUT_SECONDS // 60} min"
     else:
@@ -381,14 +392,18 @@ async def _wait_for_decisions() -> list[str]:
             try:
                 data = json.loads(TO_LABEL_FILE.read_text(encoding="utf-8"))
                 TO_LABEL_FILE.unlink()
-                ids = data.get("thread_ids", [])
-                print(f"  Received {len(ids)} thread(s) to label.")
-                return ids
+                thread_labels = data.get("thread_labels", {})
+                pair_count = sum(len(v) for v in thread_labels.values())
+                print(
+                    f"  Received {len(thread_labels)} thread(s) "
+                    f"with {pair_count} label(s) total."
+                )
+                return thread_labels
             except Exception:
                 pass
         await asyncio.sleep(2)
     print("  Timed out — skipping labeling this cycle.")
-    return []
+    return {}
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -432,15 +447,13 @@ async def main() -> None:
         await page.wait_for_selector('[gh="cm"]', timeout=300_000)
         print("[2/4] Login confirmed.\n")
 
-        # ── Step 3: create + verify label ────────────────────────────────────
-        print("[3/4] Setting up label...")
-        await _create_label(page)
-        if await _verify_label(page):
-            print(f"  VERIFIED: '{LABEL_NAME}' exists in Gmail.")
-        else:
-            print(f"  ERROR: '{LABEL_NAME}' not found after creation attempt.")
-            raise RuntimeError(f"Label '{LABEL_NAME}' could not be confirmed in Gmail.")
-        print()
+        # ── Step 3: create + verify all configured labels ────────────────────
+        print(f"[3/4] Setting up {len(LABELS)} label(s)...")
+        await _ensure_labels(page)
+        missing = await _verify_labels(page)
+        if missing:
+            raise RuntimeError(f"Labels missing after creation: {missing}")
+        print(f"  VERIFIED: all {len(LABELS)} labels exist.\n")
 
         # ── Step 4: monitoring loop ──────────────────────────────────────────
         mins = CYCLE_INTERVAL_SECONDS / 60
@@ -481,17 +494,18 @@ async def main() -> None:
                 print(f"\nemails.json written ({len(new_emails)} emails).")
                 print("CLAUDE: please read emails.json, analyze, and write to_label.json.")
 
-                to_label_ids = await _wait_for_decisions()
+                thread_labels = await _wait_for_decisions()
 
-                labeled_count = await _apply_labels_from_inbox(page, to_label_ids)
-                if labeled_count > 0:
-                    for tid in to_label_ids:
-                        subject = next(
-                            (e["subject"] for e in new_emails if e["thread_id"] == tid), tid
-                        )
-                        print(f"  [LABELED] {subject[:65]}")
+                applied, requested = await _apply_labels_from_inbox(
+                    page, thread_labels
+                )
+                for tid, labels in thread_labels.items():
+                    subject = next(
+                        (e["subject"] for e in new_emails if e["thread_id"] == tid), tid
+                    )
+                    print(f"  [LABELED {','.join(labels)}] {subject[:50]}")
 
-                print(f"\nLabeled {labeled_count}/{len(to_label_ids)} emails.")
+                print(f"\nApplied {applied}/{requested} (thread, label) pair(s).")
 
             cycle += 1
             print(f"\nSleeping {CYCLE_INTERVAL_SECONDS / 60:g} min until next cycle...")
