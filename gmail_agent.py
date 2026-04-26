@@ -454,8 +454,14 @@ async def main() -> None:
             all_emails = await _scan_inbox(page)
 
             # Keep only emails received within the last cycle window.
+            # Gmail's per-row timestamp tooltip has minute precision only
+            # ("Sun, 26 Apr 2026, 11:20"), which JS Date.parse turns into
+            # 11:20:00 — losing up to 59s of resolution. Subtract 60s of
+            # grace so a minute-rounded email straddling the cutoff isn't
+            # dropped. The same email may appear in two consecutive cycles
+            # but Gmail's label-apply is idempotent so duplication is safe.
             now_ms = time.time() * 1_000
-            cutoff_ms = now_ms - CYCLE_INTERVAL_SECONDS * 1_000
+            cutoff_ms = now_ms - CYCLE_INTERVAL_SECONDS * 1_000 - 60_000
             new_emails = [
                 e for e in all_emails
                 if isinstance(e.get("received_ms"), (int, float))
