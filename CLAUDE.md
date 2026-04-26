@@ -22,7 +22,7 @@ to_label.json        ← written by Claude Code: {"thread_ids": [...]}; agent ap
 1. Real Chrome (no profile) opens at gmail.com via subprocess + CDP
 2. User logs in manually
 3. "Internship Match" label created if it doesn't exist
-4. Every 10 min: scan inbox → keep only emails **received in the last 10 minutes** → write `emails.json` → wait for `to_label.json` → apply labels
+4. Every 2 min (default; configurable via `--interval`): scan inbox → keep only emails **received in that window** → write `emails.json` → wait for `to_label.json` → apply labels (one thread at a time, via the bulk-toolbar three-dots → "Label as" submenu)
 
 **Recency filter:** `_scan_inbox` extracts the per-row timestamp from `td.xW span[title]` (Gmail format `"Sat, 25 Apr 2026, 16:11"`) and the main loop drops anything older than `CYCLE_INTERVAL_SECONDS`. The cycle interval matches the freshness window, so this filter alone is sufficient — no `processed_ids` cache is needed.
 
@@ -55,45 +55,37 @@ venv\Scripts\python -u gmail_agent.py
 venv\Scripts\python -u gmail_agent.py --interval 2
 ```
 
-`--interval` is in minutes (float, default 10). Both the recency-window
+`--interval` is in minutes (float, default 2). Both the recency-window
 and the inter-cycle sleep use this value, and the IPC wait is half the
 cycle so a tight cadence can't hang on Claude Code analysis.
 
 Run in background with Claude Code and monitor output with `tail -f <output_file>`.
 
-## Current Status (session ended 2026-04-25)
+## Current Status (session 2026-04-26 — labeling rewritten)
 
 ### What works
 - Step 1: Chrome auto-connects via CDP (or launches fresh)
 - Step 2: Login detection via `[gh="cm"]` compose button
-- Step 3: "Internship Match" label creation via the **sidebar `+` button**
-  (`[aria-label="Create new label"][data-tooltip="Create new label"]`),
+- Step 3: "Internship Match" label creation via the sidebar `+` button,
   then `input.type()` + Enter on the MDC default-action button.
-- Step 4a: Inbox scan — single JS pass, with per-row timestamp parsed from
-  `td.xW span[title]`. Recency filter on `received_ms`.
+- Step 4a: Inbox scan — single JS pass, with per-row timestamp parsed
+  from `td.xW span[title]`. Recency filter on `received_ms`.
 - Email analysis: Claude Code reads `emails.json`, picks internship matches
 - IPC handshake: `emails.json` / `to_label.json` exchange
-- `--interval <minutes>` CLI flag (default 10)
+- **Step 4b (new):** `_apply_labels_from_inbox` now labels each thread
+  *independently*. For each thread ID:
+  1. Tick the row's checkbox.
+  2. Click bulk-toolbar `[data-tooltip="More"]` (the three-dots overflow).
+  3. Hover `[role="menuitem"]:has-text("Label as")` (it's `aria-haspopup`,
+     opens on hover not click).
+  4. Click `[role="menuitemcheckbox"][title="Internship Match"]` with
+     `force=True` (submenu is animating; Playwright stability times out
+     but the click reaches Gmail).
+  5. Escape twice + untick the row before moving to the next thread.
 
-### KNOWN BUG — RESUME HERE
-**`_apply_labels_from_inbox` over-labels.** When asked to label N specific
-threads, Gmail ends up applying the label to *every email currently scanned
-in the inbox view*. End-of-session state: ~42 inbox threads have the
-"Internship Match" label even though only 3 were ever requested.
-
-The agent reports `Labeled N/N emails.` honestly — `selected` only counts
-checkbox-click successes — but the actual Gmail outcome is wrong. Root
-cause not yet identified; possibilities:
-- The bulk-toolbar Label button operates on something broader than the
-  checked rows (e.g., the entire scanned conversation set).
-- The label-picker click hits the wrong target.
-
-We started exploring a per-conversation alternative (open the thread, then
-use the conversation toolbar / `l` shortcut), but Gmail keyboard shortcuts
-are off and the conversation toolbar is collapsed into "More email options"
-with a zero-sized hitbox in the user's window size.
-
-**Cleanup pending:** ~39 wrong threads still carry the label.
+  The previous bulk-flow over-labeled everything in the inbox; this
+  per-thread version was verified end-to-end on 2026-04-26.
+- `--interval <minutes>` CLI flag — default 2.
 
 ### Known thread IDs for test internship emails
 ```json
@@ -104,13 +96,12 @@ with a zero-sized hitbox in the user's window size.
 - `#thread-f:1863448178752084791` — "Internship for Yehya"
 - `#thread-f:1863452174359364087` — "Hello" (AI/medicine internship offer)
 
-### Suggested next steps
-1. Bulk-remove "Internship Match" from non-internship threads.
-2. Replace bulk-checkbox flow with per-thread labeling (open conversation,
-   click toolbar Label, pick label). Options:
-   - Force a wider Playwright viewport so the toolbar isn't collapsed.
-   - Or have the user enable Gmail keyboard shortcuts and use `l`.
-3. Re-test labeling end-to-end before declaring it fixed again.
+### Removing a label (verified 2026-04-26)
+Same flow as adding, just clicks an already-checked menuitemcheckbox to
+toggle it off. In this user's Gmail UI there is no separate "Apply"
+button visible after the toggle — the click auto-applies when the menu
+closes. (User-facing screenshots show an Apply menu item; that may be
+older or only appear when filtering via the picker's search box.)
 
 ## Key Lessons (all saved in memory/)
 

@@ -4,12 +4,14 @@ How it works:
   1. Launches the user's real Chrome (no profile) at gmail.com.
   2. Waits for the user to log in manually (the only manual step).
   3. Creates the Gmail label 'Internship Match' if it doesn't exist.
-  4. Every 10 minutes:
-       a. Scans the inbox and keeps only emails received in the last 10 min.
+  4. Every cycle (default 2 min, set via --interval):
+       a. Scans the inbox and keeps only emails received in that window.
        b. Writes emails.json + prints to stdout.
-       c. Waits up to 5 minutes for Claude Code to drop to_label.json.
-       d. Applies the label to threads listed in to_label.json.
-       e. Sleeps 10 minutes, then repeats.
+       c. Waits for Claude Code to drop to_label.json.
+       d. Applies the label to threads listed in to_label.json — each
+          thread independently (tick row → bulk More → 'Label as' →
+          click the menuitemcheckbox → untick).
+       e. Sleeps the cycle interval, then repeats.
 
 IPC protocol:
   emails.json   — written by this script; Claude Code reads it to decide.
@@ -278,12 +280,76 @@ async def _scan_inbox(page: Page) -> list[dict]:
     return [e for e in emails if e.get("subject") or e.get("body")]
 
 
-async def _apply_labels_from_inbox(page: Page, thread_ids: list[str]) -> int:
-    """Select matching rows by checkbox in inbox and apply label via toolbar.
+async def _label_one_thread(page: Page, tid: str) -> bool:
+    """Apply LABEL_NAME to a single thread via:
+    tick row checkbox → bulk-toolbar More → hover 'Label as' → click the
+    `[role="menuitemcheckbox"][title=LABEL_NAME]` entry.
 
-    Uses the same JS multi-attribute ID lookup as _scan_inbox so the thread
-    ID format always matches regardless of which data-* attribute holds it.
-    Returns the number of rows successfully selected and labeled.
+    Each thread is processed in isolation (tick / label / untick) so a failure
+    on one thread can't leave residual selection that affects the next one.
+    """
+    row_index: int = await page.evaluate(
+        """(tid) => [...document.querySelectorAll('tr.zA')].findIndex(r =>
+            (r.dataset.threadId
+              || r.querySelector('[data-thread-id]')?.dataset.threadId
+              || r.querySelector('[data-legacy-thread-id]')?.dataset.legacyThreadId) === tid)""",
+        tid,
+    )
+    if row_index < 0:
+        print(f"  [WARN] Thread {tid[:24]} not found in inbox view.")
+        return False
+
+    def _toggle_row_cb_js() -> str:
+        return """(idx) => {
+            const row = document.querySelectorAll('tr.zA')[idx];
+            if (!row) return false;
+            const cb = row.querySelector('.oZ-jc') ||
+                       row.querySelector('[role="checkbox"]') ||
+                       row.querySelector('td.PF');
+            if (cb) { cb.click(); return true; }
+            return false;
+        }"""
+
+    if not await page.evaluate(_toggle_row_cb_js(), row_index):
+        return False
+    await asyncio.sleep(1.5)  # bulk toolbar animates in
+
+    try:
+        await page.locator('[data-tooltip="More"]').first.click(timeout=8_000)
+        await asyncio.sleep(0.8)
+        await page.locator(
+            '[role="menuitem"]:has-text("Label as")'
+        ).first.hover(timeout=4_000)
+        await asyncio.sleep(1.5)  # submenu animates open
+        # `force=True`: the submenu is animating, so Playwright's stability
+        # check times out — but the actual click still reaches Gmail.
+        await page.locator(
+            f'[role="menuitemcheckbox"][title="{LABEL_NAME}"]'
+        ).first.click(timeout=8_000, force=True)
+        await asyncio.sleep(0.6)
+        return True
+    except Exception as e:
+        print(f"  [WARN] Could not label {tid[:24]}: {e}")
+        return False
+    finally:
+        # Always close any open menu and untick the row
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.4)
+            await page.evaluate(_toggle_row_cb_js(), row_index)
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+
+async def _apply_labels_from_inbox(page: Page, thread_ids: list[str]) -> int:
+    """Apply LABEL_NAME to each thread in `thread_ids`. Returns the count
+    successfully labeled.
+
+    Each thread is labeled independently to avoid the previous bulk-flow bug
+    where a single Label-picker action somehow affected unrelated rows.
     """
     if not thread_ids:
         return 0
@@ -294,145 +360,11 @@ async def _apply_labels_from_inbox(page: Page, thread_ids: list[str]) -> int:
     except Exception:
         return 0
 
-    selected = 0
+    labeled = 0
     for tid in thread_ids:
-        row_index: int = await page.evaluate(
-            """(tid) => {
-                const rows = [...document.querySelectorAll('tr.zA')];
-                return rows.findIndex(row => {
-                    const id =
-                        row.dataset.threadId ||
-                        row.querySelector('[data-thread-id]')?.dataset.threadId ||
-                        row.querySelector('[data-legacy-thread-id]')?.dataset.legacyThreadId;
-                    return id === tid;
-                });
-            }""",
-            tid,
-        )
-
-        if row_index < 0:
-            print(f"  [WARN] Thread {tid[:24]} not found in inbox view.")
-            continue
-
-        # Use JS to click the checkbox element directly (more reliable than positional)
-        clicked_cb = await page.evaluate(
-            """(index) => {
-                const rows = document.querySelectorAll('tr.zA');
-                const row = rows[index];
-                if (!row) return false;
-                const cb = row.querySelector('.oZ-jc') ||
-                           row.querySelector('[role="checkbox"]') ||
-                           row.querySelector('td.PF');
-                if (cb) { cb.click(); return true; }
-                return false;
-            }""",
-            row_index,
-        )
-
-        if clicked_cb:
-            selected += 1
-        else:
-            # Fallback: hover + positional click
-            row = page.locator("tr.zA").nth(row_index)
-            await row.scroll_into_view_if_needed()
-            await row.hover()
-            await asyncio.sleep(0.2)
-            try:
-                await row.click(position={"x": 20, "y": 16}, timeout=3_000)
-                selected += 1
-            except Exception as e:
-                print(f"  [WARN] Could not select row {row_index}: {e}")
-
-    if selected == 0:
-        return 0
-
-    await asyncio.sleep(0.5)
-
-    # Confirm the bulk-action toolbar appeared (Archive button is always present)
-    toolbar_visible = False
-    for sel in ('[data-tooltip="Archive"]', '[aria-label="Archive"]'):
-        try:
-            if await page.locator(sel).first.is_visible(timeout=3_000):
-                toolbar_visible = True
-                break
-        except Exception:
-            continue
-    if not toolbar_visible:
-        print("  [WARN] Bulk toolbar did not appear — rows may not be checked.")
-
-    # Find and click the Label button
-    label_clicked = False
-    for sel in (
-        '[data-tooltip="Label"]', '[data-tooltip="Labels"]',
-        '[data-tooltip*="Label"]', '[aria-label="Label"]',
-        '[aria-label="Labels"]', 'div[act="3"]',
-    ):
-        btn = page.locator(sel).first
-        try:
-            if await btn.is_visible(timeout=1_500):
-                await btn.click()
-                label_clicked = True
-                break
-        except Exception:
-            continue
-
-    # Fallback: "More" overflow menu in bulk toolbar
-    if not label_clicked:
-        try:
-            more = page.locator('[data-tooltip="More"]').first
-            if await more.is_visible(timeout=2_000):
-                await more.click()
-                await asyncio.sleep(0.3)
-                item = page.locator('[role="menuitem"]:has-text("Label")').first
-                if await item.is_visible(timeout=2_000):
-                    await item.click()
-                    label_clicked = True
-        except Exception:
-            pass
-
-    if not label_clicked:
-        print("  [WARN] Could not find Label button in toolbar.")
-        return 0
-
-    await asyncio.sleep(0.4)
-
-    try:
-        # Fill the search box if present to filter to our label
-        search = page.locator('.J-M-Jz input[type="text"]').first
-        if await search.is_visible(timeout=1_500):
-            await search.fill(LABEL_NAME[:12])
-            await asyncio.sleep(0.4)
-
-        # Click the label entry — Gmail uses title, aria-label, or plain text
-        label_el = None
-        for sel in (
-            f'[title="{LABEL_NAME}"]',
-            f'[aria-label="{LABEL_NAME}"]',
-            f'.J-M-Jz :text-is("{LABEL_NAME}")',
-            f'text="{LABEL_NAME}"',
-        ):
-            el = page.locator(sel).first
-            try:
-                if await el.is_visible(timeout=1_000):
-                    label_el = el
-                    break
-            except Exception:
-                continue
-
-        if label_el is None:
-            print(f"  [WARN] '{LABEL_NAME}' not found in label picker.")
-            return 0
-
-        await label_el.click(timeout=4_000)
-
-        apply_btn = page.locator('button:has-text("Apply")').first
-        if await apply_btn.is_visible(timeout=1_000):
-            await apply_btn.click()
-
-        return selected
-    except Exception as e:
-        print(f"  [WARN] Label picker failed: {e}")
-        return 0
+        if await _label_one_thread(page, tid):
+            labeled += 1
+    return labeled
 
 
 # ── IPC ──────────────────────────────────────────────────────────────────────
@@ -466,8 +398,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interval",
         type=float,
-        default=10.0,
-        help="Cycle length in minutes — also the email-recency window. Default: 10.",
+        default=2.0,
+        help="Cycle length in minutes — also the email-recency window. Default: 2.",
     )
     return parser.parse_args()
 
