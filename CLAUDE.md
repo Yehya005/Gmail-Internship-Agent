@@ -51,9 +51,11 @@ The number of labels and the number of CV chunks are both **variable** — they 
 6. **Step 1 — `read_emails.read(page, cycle_seconds)`.** Navigate to `#inbox`, query `tr.zA`, extract per-row `{thread_id, subject, sender, received_ms}` (timestamp parsed from `td.xW span[title]` with fallbacks). Recency-filter: keep `received_ms ≥ now − cycle − 60 s` (the 60-s safe zone covers Gmail's minute-only timestamps). For each survivor, dispatch a real `mousedown/mouseup/click` chain on `.y6/.bog` inside a single `page.evaluate` so DOM re-renders can't detach the locator; URL flips to `#inbox/FMfcgz...`; scrape `div.a3s.aiL` for the full body; navigate back. Returns the partial set on any per-email failure so step 2 can still run on what made it through.
 7. **Step 2 — `classifier.classify_emails(emails)`.** Pure-Python decision, no Chrome. Per email:
    - `scam_scorer.score_email_dict(...)` → if score ≥ 0.5, label is `["Scam Risk"]` only and we stop (Scam Risk is exclusive).
-   - Else `cv_match.match(body)` returns the top-5 retrieved CV chunks each with `{similarity, topics, kind}`. If max similarity < 0.30 the email is off-topic for this CV → no labels.
-   - Else for each PROJECT chunk above 0.30 similarity, the topics it carries are emitted *if* the email body contains at least one keyword for that topic. Generic CV sections (Skills, Interests, …) carry no topics by design — they only contribute to the similarity score.
-   - Topics not covered by any project (DevOps in this CV) get a direct body-keyword fallback so they can still surface.
+   - Else `cv_match.match(body)` returns the top-5 retrieved CV chunks each with `{similarity, topics, kind}`. If max similarity < 0.30 the email is off-topic for this CV → no labels. Generic CV sections (Skills, Interests, …) carry no topics by design — they only contribute to the similarity score.
+   - **Two-tier RAG voting** over project chunks at sim ≥ 0.30:
+       - **High-confidence** (sim ≥ 0.50): emit each of the chunk's topics directly. Multiple high-scoring chunks for different topics will multi-label even on terse bodies.
+       - **Moderate** (0.30 ≤ sim < 0.50): emit a topic only if the email body literally contains one of that topic's keywords. Stops a moderately-similar project (e.g. CPU Simulator at 0.34) from dragging Software Engineering onto every tech email.
+   - **Body-keyword safety net.** For any topic not yet emitted, add it if the body literally mentions one of its keywords. Catches two cases: (a) topics not covered by any project chunk (DevOps in this CV); (b) topics whose project chunk ranked just below threshold even though the email mentions them (e.g. a 'research using deep learning' email where ECG dominates retrieval and EEG sits at sim 0.26). Off-topic pitches are still blocked by the cv_match threshold gate above, so this won't fire on marketing-style content.
    - Each email's dict is mutated in place to attach the `scam_features` and `cv_match` blocks (used by `history.jsonl` + the dashboard).
 8. **Step 3 — `apply_labels.apply(page, thread_labels)`.** For each `(thread, label)` pair, in isolation:
    - Tick the row's checkbox via JS on `.oZ-jc` / `[role="checkbox"]`.
@@ -101,13 +103,18 @@ venv\Scripts\python -m playwright install chromium
 ```bash
 # A) Standalone agent run
 venv\Scripts\python -u gmail_agent.py
-venv\Scripts\python -u gmail_agent.py --interval 2 --ipc-wait 20
+venv\Scripts\python -u gmail_agent.py --interval 2
 
 # B) Dashboard (recommended) — handles Start/Stop in the sidebar
 venv\Scripts\python -m streamlit run streamlit_app.py
+
+# C) CLI access to the individual pipeline modules (for debugging)
+venv\Scripts\python read_emails.py --interval 2 --out emails.json
+venv\Scripts\python classifier.py emails.json --output to_label.json
+venv\Scripts\python apply_labels.py --in to_label.json
 ```
 
-`--interval` is in minutes (float, default 2) and applies to both the recency window and the inter-cycle sleep. `--ipc-wait` (default 20 s) is how long the agent waits for an external `to_label.json` before falling back to the local classifier — bump it if you have a slow LLM in the loop.
+`--interval` is in minutes (float, default 2) and applies to both the recency window and the inter-cycle sleep. The orchestrator no longer takes `--ipc-wait` — classification is in-process and synchronous now that the rule-based decision lives in `classifier.py`.
 
 ## Current Status (session 2026-04-26)
 
@@ -118,7 +125,7 @@ venv\Scripts\python -m streamlit run streamlit_app.py
 - Full-body scrape per fresh email (subject-cell click via real-MouseEvent dispatch).
 - `scam_scorer.py` — heuristic features (sender domain, payment-phrase lexicon incl. `$N fee/charge` regex, no-interview / fast-track signals, generic greetings, suspicious URLs, urgency, hyperbolic comp, all-caps subject), each with a human-readable reason.
 - `cv_match.py` — RAG over CV chunks (sentence-transformers, cosine retrieval, top-k retrieved evidence + missing skills).
-- `classifier.py` — autonomous fallback (scam-first → keyword routing gated on cv_match score).
+- `classifier.py` — autonomous decision step: scam-first, two-tier RAG voting (high-sim bypass + body-confirm for moderate sim), broader body-keyword safety net for missed labels.
 - Per-thread label apply via three-dots → "Label as" → menuitemcheckbox.
 - `history.jsonl` per-cycle log.
 - Streamlit dashboard with auto-refresh + sidebar Start/Stop + free-text filter.
@@ -152,7 +159,8 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 8. **Recency filter** is the only dedup needed when cycle interval == freshness window. No `processed_ids` cache.
 9. **Click targets in inbox rows:** `.y6 / .bog` (subject cell), not row-position — position clicks land on hover-revealed Archive icons.
 10. **Full bodies via `div.a3s.aiL`** — row snippets are ~100 chars and let scammers bury the payload.
-11. **All files inside the project directory** — venv in `venv/`, browsers in `browsers/`.
+11. **Two-tier classifier voting:** strong RAG signals (sim ≥ 0.50) are trusted directly so multi-label cases work on terse bodies; moderate matches (0.30–0.50) require a body-keyword confirmation; topics not yet emitted get a body-keyword safety net so EEG-Research-style misses on terse-CV chunks aren't dropped.
+12. **All files inside the project directory** — venv in `venv/`, browsers in `browsers/`.
 
 ## Course Evaluation Weights
 
