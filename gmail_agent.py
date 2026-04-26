@@ -40,16 +40,21 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 
+from scam_scorer import score_email_dict
+
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 # Topic-specific labels. Each email can receive zero, one, or several of
 # these — Claude Code decides per-email based on the user's CV/skills.
+# 'Scam Risk' is orthogonal to the topic labels — applied when scam_scorer
+# heuristics + LLM judgment flag an email as a likely fake/predatory offer.
 LABELS = [
     "AI/ML",                # AI, ML, Deep Learning, NLP, TF/PyTorch/Keras
     "Research",             # AI/Neuroscience/BCI/EEG/Bioinformatics/DTI roles
     "Software Engineering", # full-stack, Flask, React, web, Python/JS
     "Embedded Systems",     # C, VHDL, digital design, microcontrollers
     "DevOps",               # Docker, Git, Linux, CI/CD, infra
+    "Scam Risk",            # deterministic heuristics + LLM judgment flagged this
 ]
 EMAILS_PER_CYCLE = 50
 CDP_PORT = 9222
@@ -286,7 +291,85 @@ async def _scan_inbox(page: Page) -> list[dict]:
         }""",
         EMAILS_PER_CYCLE,
     )
-    return [e for e in emails if e.get("subject") or e.get("body")]
+    enriched = []
+    for e in emails:
+        if not (e.get("subject") or e.get("body")):
+            continue
+        # Attach deterministic scam-risk features (computed locally, no LLM).
+        # Claude Code reads these alongside the body when deciding labels.
+        e["scam_features"] = score_email_dict(e)
+        enriched.append(e)
+    return enriched
+
+
+async def _open_and_get_full_body(page: Page, tid: str) -> str | None:
+    """Open the conversation for `tid` and return the concatenated full body
+    of every message in the thread, or None if the row can't be found.
+
+    Scammers commonly bury the scam payload (training fee, payment links)
+    several paragraphs in, so the row-snippet alone is too short to score
+    reliably. This helper navigates into the conversation, scrapes every
+    message frame, and navigates back to the inbox.
+    """
+    # Find the row + click its subject in a single JS evaluate call. Doing
+    # the lookup and click atomically avoids the "Element is not attached
+    # to the DOM" race when Gmail's SPA re-renders rows between two
+    # separate Playwright calls. We dispatch a real MouseEvent chain
+    # rather than `el.click()` because Gmail's row handlers listen for
+    # mousedown/mouseup, not click.
+    result = await page.evaluate(
+        """(tid) => {
+            const row = [...document.querySelectorAll('tr.zA')].find(r =>
+                (r.dataset.threadId
+                  || r.querySelector('[data-thread-id]')?.dataset.threadId
+                  || r.querySelector('[data-legacy-thread-id]')?.dataset.legacyThreadId) === tid);
+            if (!row) return 'no-row';
+            const subj = row.querySelector('.y6, .bog');
+            if (!subj) return 'no-subj';
+            const r = subj.getBoundingClientRect();
+            const x = r.x + r.width / 2;
+            const y = r.y + r.height / 2;
+            for (const type of ['mousedown', 'mouseup', 'click']) {
+                subj.dispatchEvent(new MouseEvent(type, {
+                    bubbles: true, cancelable: true,
+                    button: 0, clientX: x, clientY: y,
+                }));
+            }
+            return 'clicked';
+        }""",
+        tid,
+    )
+    if result != 'clicked':
+        print(f"    [body-scrape] click prep failed for {tid[:24]}: {result}")
+        return None
+    await asyncio.sleep(2.0)  # message bodies render after navigation
+    print(f"    [body-scrape] opened, url={page.url[-40:]}")
+
+    body = await page.evaluate(
+        """() => {
+            const sels = ['div.a3s.aiL', 'div.a3s', 'div.ii.gt > div'];
+            const seen = new Set();
+            const parts = [];
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    const t = (el.innerText || '').trim();
+                    if (t) parts.push(t);
+                }
+            }
+            return parts.join('\\n\\n---\\n\\n') || null;
+        }"""
+    )
+    print(f"    [body-scrape] scraped {len(body) if body else 0} chars")
+
+    await page.goto("https://mail.google.com/#inbox", wait_until="domcontentloaded")
+    try:
+        await page.wait_for_selector("tr.zA", timeout=15_000)
+    except Exception:
+        pass
+
+    return body
 
 
 _TOGGLE_ROW_CB_JS = """(idx) => {
@@ -487,6 +570,16 @@ async def main() -> None:
                 print(f"Found {len(new_emails)} new email(s).")
                 for i, e in enumerate(new_emails, 1):
                     print(f"  [{i}] {e['subject'][:70]}")
+
+                # Open each fresh email and replace the row-snippet body with
+                # the full message text, then re-run the scam scorer. Snippet
+                # alone is ~100 chars and lets scammers bury the payload.
+                print("  Reading full bodies...")
+                for e in new_emails:
+                    full = await _open_and_get_full_body(page, e["thread_id"])
+                    if full:
+                        e["body"] = full
+                        e["scam_features"] = score_email_dict(e)
 
                 EMAILS_FILE.write_text(
                     json.dumps(new_emails, indent=2, ensure_ascii=False), encoding="utf-8"
