@@ -51,6 +51,8 @@ PAYMENT_PHRASES = [
     "send money", "wire transfer", "western union", "moneygram",
     "bitcoin", "btc", "crypto payment", "gift card",
     "advance payment", "upfront payment", "deposit required",
+    "as deposit", "as a deposit",
+    "pay a fee", "pay the fee", "pay a deposit",
     "purchase a kit", "purchase equipment",
 ]
 
@@ -67,8 +69,9 @@ NO_INTERVIEW_PHRASES = [
 URGENCY_PHRASES = [
     "urgent", "act now", "limited spots", "limited slots",
     "seats are limited", "rolling basis", "at the earliest",
-    "respond within 24 hours", "respond immediately", "last chance",
-    "today only", "expires today", "don't miss",
+    "as soon as possible", "respond within 24 hours",
+    "respond immediately", "register today", "register now",
+    "last chance", "today only", "expires today", "don't miss",
 ]
 
 # Regex: any "$<amount>" mention next to a fee/charge/payment word.
@@ -165,12 +168,16 @@ def score_email(email: dict) -> ScamFeatures:
         reasons.append(f"Asks for upfront payment: {sample}")
         points += 0.40  # very strong signal — saturate near scam regardless
 
-    # 2b. Generic "$<amount> charge/fee/..." pattern, even without our lexicon
+    # 2b. Generic "$<amount> charge/fee/..." pattern, even without our
+    # lexicon. This is a smoking gun: real internships never ask for a
+    # specific dollar amount tied to a deposit / fee / charge / payment.
+    # Weighted high enough that a single match crosses SCAM_THRESHOLD on
+    # its own — combined with even one other cue it pushes well above.
     dollar_hits = DOLLAR_FEE_RE.findall(email.get("body") or "")
     flags["dollar_fee_hits"] = len(dollar_hits)
     if dollar_hits:
         reasons.append(f"Money amount tied to a fee/charge: '{dollar_hits[0]}'")
-        points += 0.35
+        points += 0.55
 
     # 2c. "No interview required" / fast-track signals — almost never legit
     no_int = [p for p in NO_INTERVIEW_PHRASES if p in body]
