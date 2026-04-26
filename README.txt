@@ -8,7 +8,7 @@ Author: Yehya Mazloum, Lebanese American University.
 
 
 ====================================================================
-WHAT THIS DOES (PLAIN ENGLISH)
+WHAT THIS DOES 
 ====================================================================
 
 You are a final-year engineering student. Your inbox fills up with
@@ -17,7 +17,7 @@ your skills. Reading them all is a waste of time.
 
 This project runs a small program in the background that:
 
-  1. Watches your Gmail inbox every 2 minutes.
+  1. Watches your Gmail inbox every 2 minutes(or any cycle time u chose).
   2. Reads each new email's full body.
   3. Decides if it's a scam (asks for "training fees", "deposits",
      fake urgency).
