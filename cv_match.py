@@ -122,12 +122,99 @@ def _cv_has_skill(skill: str, cv_text_lower: str) -> bool:
     return any(a.strip() in cv_text_lower for a in aliases)
 
 
+# ── Chunk → topic tagging ───────────────────────────────────────────────────
+#
+# Each CV chunk is tagged with zero or more topic labels at load time. The
+# classifier later takes the union of topics across the chunks RAG retrieves
+# for an email — so labels are grounded in *what's in the CV*, not in
+# keywords matched on the email body. This is the "use the chunks when
+# labeling" requirement.
+
+_CHUNK_TOPIC_RULES: dict[str, list[str]] = {
+    "AI/ML": [
+        "deep learning", "machine learning", "ml", "ai/ml",
+        "tensorflow", "pytorch", "keras", "nlp", "transformer", "cnn",
+        "neural network", "artificial intelligence",
+    ],
+    "Research": [
+        "research", "neuroscience", "bioinformatics", "bci", "eeg",
+        "brain-computer", "drug-target", "dti", "ongoing",
+    ],
+    "Software Engineering": [
+        "flask", "react", "streamlit", "javascript", "full-stack",
+        "fullstack", "web development", "software engineering",
+        "software engineer", "python", "node",
+    ],
+    "Embedded Systems": [
+        "embedded", "vhdl", "verilog", "microcontroller", "fpga",
+        "hcs12", "assembly", "digital design", "elevator", "rtos",
+    ],
+    "DevOps": [
+        "docker", "git", "linux", "ci/cd", "devops", "containers",
+    ],
+}
+
+
+_GENERIC_SECTION_PREFIXES = (
+    "skills:", "interests:", "preferred internship", "languages:",
+    "degree:", "university:", "year:",
+)
+
+
+def _is_generic(chunk_text: str) -> bool:
+    head = chunk_text.split("\n", 1)[0].lower()
+    if any(head.startswith(p) for p in _GENERIC_SECTION_PREFIXES):
+        return True
+    return "this project is a requirment" in chunk_text.lower()
+
+
+def _raw_chunk_topics(chunk_text: str) -> list[str]:
+    """Apply the rule table — every topic whose keywords appear gets in."""
+    text = chunk_text.lower()
+    out: list[str] = []
+    for topic, kws in _CHUNK_TOPIC_RULES.items():
+        if any(kw in text for kw in kws):
+            out.append(topic)
+    return out
+
+
+def _enrich_for_embedding(chunk: str, topics: list[str]) -> str:
+    """Append the topic NAMES (not full keyword lists) to a chunk's
+    *embedding* text. The user-visible chunk stays original; this only
+    changes what the encoder sees. We use just the topic names so a
+    brief project bullet like 'HCS12 Assembly Elevator Control System'
+    matches 'embedded systems' queries without dragging in every other
+    SE/AI/ML keyword that would crowd out other projects."""
+    if not topics:
+        return chunk
+    return chunk + "\n(Topic: " + ", ".join(topics) + ")"
+
+
+def _resolve_chunk_topics(chunks: list[str]) -> list[list[str]]:
+    """Only concrete project chunks carry topics for label voting.
+    Generic sections (Skills, Interests, ...) are tagged empty — they
+    still contribute to the *similarity score* (an email is "on topic"
+    for the candidate's CV at all), but their topics would be too broad
+    and would crowd out the projects' specific signals. Topics not
+    covered by any project (e.g. DevOps in this CV) are handled by a
+    small body-keyword detector in classifier.py."""
+    out: list[list[str]] = []
+    for c in chunks:
+        out.append([] if _is_generic(c) else _raw_chunk_topics(c))
+    return out
+
+
+def covered_topics(chunks: list[str]) -> set[str]:
+    """Set of topics covered by at least one project chunk."""
+    return {t for c in chunks for t in (_raw_chunk_topics(c) if not _is_generic(c) else [])}
+
+
 # ── Matcher ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class CVMatch:
     score: float                           # 0..1 — best chunk similarity
-    matched: list[dict]                    # [{chunk, similarity}]
+    matched: list[dict]                    # [{chunk, similarity, topics}]
     missing_skills: list[str]              # skills in JD but not in CV
 
 
@@ -138,13 +225,31 @@ class CVMatcher:
         cv_text = cv_path.read_text(encoding="utf-8")
         self.cv_text_lower = cv_text.lower()
         self.chunks = _chunk_cv(cv_text)
+        self.chunk_topics = _resolve_chunk_topics(self.chunks)
+        # 'project' = concrete experience entry; 'generic' = Skills,
+        # Interests, etc. The classifier uses kind to prefer projects
+        # when both are retrieved (so PyTorch-heavy Skills doesn't drown
+        # out the actual AI/ML project).
+        self.chunk_kinds = [
+            "generic" if _is_generic(c) else "project"
+            for c in self.chunks
+        ]
         self.model = SentenceTransformer(model_name)
-        # Encode once at startup; embeddings are cheap to keep in RAM.
+        # Encode each chunk; projects get domain-keyword cues appended
+        # to compensate for brief titles ('HCS12 Assembly...' → boosted
+        # by embedded-systems cues so it can compete with keyword-rich
+        # generic sections like Skills). Generic chunks are NOT
+        # enriched — they already cover plenty of keywords on their own
+        # and enriching them would crowd out the projects.
+        for_embed = [
+            _enrich_for_embedding(c, t) if k == "project" else c
+            for c, t, k in zip(self.chunks, self.chunk_topics, self.chunk_kinds)
+        ]
         self.chunk_embs = self.model.encode(
-            self.chunks, normalize_embeddings=True, convert_to_numpy=True
+            for_embed, normalize_embeddings=True, convert_to_numpy=True
         )
 
-    def match(self, email_text: str, top_k: int = 3, threshold: float = 0.25) -> CVMatch:
+    def match(self, email_text: str, top_k: int = 5, threshold: float = 0.25) -> CVMatch:
         if not email_text or not email_text.strip():
             return CVMatch(score=0.0, matched=[], missing_skills=[])
 
@@ -157,6 +262,8 @@ class CVMatcher:
             {
                 "chunk": self.chunks[i][:140],
                 "similarity": round(float(sims[i]), 3),
+                "topics": self.chunk_topics[i],
+                "kind": self.chunk_kinds[i],
             }
             for i in order
             if sims[i] >= threshold

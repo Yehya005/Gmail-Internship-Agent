@@ -4,10 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Course project (COE548/748): an agent that monitors a Gmail inbox every few minutes, scrapes each fresh email's full body, scores it for scam risk, retrieves matching evidence from the user's CV (RAG), and applies one or more labels. Two decision paths share the same Gmail-automation runtime:
+Course project (COE548/748): an agent that monitors a Gmail inbox every few minutes, scrapes each fresh email's full body, scores it for scam risk, retrieves matching evidence from the user's CV (RAG), and applies one or more labels.
 
-- **Autonomous mode** — the bundled rule-based `classifier.py` decides labels using `scam_features` + `cv_match` + topic keywords. No LLM call, no API key. This is the default when the agent is launched from the Streamlit dashboard.
-- **External-override mode** — any other process (Claude Code, an LLM-API caller) can drop `to_label.json` within the IPC window and overrule the local classifier.
+`gmail_agent.py` is now a thin **orchestrator**. Each cycle calls three single-purpose modules in order: `read_emails.read()` → `classifier.classify_emails()` → `apply_labels.apply()`. Each module is also runnable as a CLI (`python read_emails.py`, etc.) for debugging. No IPC wait, no external decider — the rule-based classifier is in-process and synchronous. If a step raises, the agent logs the error, runs whatever partial work succeeded, and continues to the next cycle.
 
 **Labels** are an *editable list* in `gmail_agent.py` — `LABELS = [...]`. Add or remove categories there; the agent creates each missing one in Gmail at startup (idempotent). Today's default set covers the user's CV: `AI/ML`, `Research`, `Software Engineering`, `Embedded Systems`, `DevOps`, `Scam Risk`. `Scam Risk` is **exclusive** — when applied, no topic labels go on the same email.
 
@@ -16,19 +15,21 @@ Course project (COE548/748): an agent that monitors a Gmail inbox every few minu
 ## Architecture
 
 ```
-gmail_agent.py     ← single entry point, runs the full loop
+gmail_agent.py     ← orchestrator — cycle loop calls the three modules below
+read_emails.py     ← step 1: scan inbox + recency + full-body scrape
+classifier.py      ← step 2: scam-first → RAG → topic union with body confirm
+apply_labels.py    ← step 3: per-thread three-dots → 'Label as' flow
+
 scam_scorer.py     ← deterministic scam-risk heuristic (no LLM)
-cv_match.py        ← RAG matcher: embeds CV chunks, retrieves on each email
-classifier.py      ← rule-based fallback for autonomous label decisions
+cv_match.py        ← RAG matcher: embeds CV chunks (with topic tags), cosine
 streamlit_app.py   ← dashboard: per-email cards + sidebar Start/Stop + auto-refresh
 
 plan.txt           ← user's CV (drives both topic-keyword tables and CV-RAG chunks)
 venv/              ← project-local Python virtualenv (use venv/Scripts/python)
 browsers/          ← Playwright's Chromium (PLAYWRIGHT_BROWSERS_PATH)
 
-emails.json        ← written each cycle by the agent; consumers read it
-to_label.json      ← optional override from an external decider; agent applies labels
-history.jsonl      ← append-only per-cycle log; the dashboard renders from this file
+emails.json        ← step 1 writes; step 2 consumes; the dashboard inspects
+history.jsonl      ← append-only per-cycle log; dashboard renders from this
 agent.pid          ← PID of the agent spawned by the dashboard's Start button
 agent_output.log   ← agent stdout/stderr (terminal runs + dashboard runs share it)
 ```
@@ -47,27 +48,24 @@ The number of labels and the number of CV chunks are both **variable** — they 
 
 ### Per cycle (default 2 min, set via `--interval`)
 
-6. **Scan inbox.** Navigate to `#inbox`, query `tr.zA`. For each row extract `thread_id`, subject (`.y6 > span` / `.bog`), sender (`.zF[name]`), snippet (`.y2`), and `received_ms` (parse `td.xW span[title]`; fall back to visible text, then `Date.now()` so an unparseable tooltip never silently drops the email). Attach a snippet-level `scam_features` block from `scam_scorer.py`.
-7. **Recency filter.** Keep emails with `received_ms ≥ now − cycle − 60 s`. The 60-s safe zone covers Gmail's minute-only timestamp precision. Same email may appear in two consecutive cycles — labelling is idempotent so this is harmless.
-8. **Open each fresh email.** For every survivor:
-   - Find the row's index, dispatch a real `mousedown / mouseup / click` chain on `.y6 / .bog` inside one `page.evaluate` so DOM re-renders can't detach the locator. Position-based row clicks were earlier hitting hover-revealed Archive icons.
-   - URL changes to `#inbox/FMfcgz...`. Scrape `div.a3s.aiL` for the full conversation body.
-   - Re-run `scam_scorer` on the full text (catches buried payloads).
-   - Run `cv_match.match(body)`: encode the body, cosine against all CV chunks, return top-k retrieved chunks + max-similarity score + missing-skills list.
-   - Navigate back to `#inbox`.
-9. **Write `emails.json`** — list of `{thread_id, subject, sender, body, received_ms, scam_features, cv_match}`.
-10. **Wait up to `--ipc-wait` seconds (default 20) for `to_label.json`.** If it arrives, parse `{"thread_labels": {"<id>": ["AI/ML", ...], ...}}` and use it. If it doesn't, run `classifier.py`:
-    - `scam_features.score ≥ 0.5` → `["Scam Risk"]` only.
-    - Else needs the word "internship" + `cv_match.score ≥ 0.30`.
-    - Else emit every topic in `LABELS` whose keywords appear in subject + body.
-11. **Apply labels per `(thread, label)` pair**, in isolation:
-    - Tick row checkbox via JS on `.oZ-jc` / `[role="checkbox"]`.
-    - Click bulk-toolbar `[data-tooltip="More"]` (three-dots overflow).
-    - Hover `[role="menuitem"]:has-text("Label as")` — `aria-haspopup="true"`, opens on hover not click.
-    - `force`-click `[role="menuitemcheckbox"][title="<label>"]` (submenu animation defeats Playwright's stability check, click still reaches Gmail).
-    - Escape twice + untick the row before the next pair.
-12. **Append a record per email to `history.jsonl`** — full email + `labels_applied` + `cycle_at`. Streamlit reads this.
-13. **Sleep `--interval` minutes**, loop back to step 6.
+6. **Step 1 — `read_emails.read(page, cycle_seconds)`.** Navigate to `#inbox`, query `tr.zA`, extract per-row `{thread_id, subject, sender, received_ms}` (timestamp parsed from `td.xW span[title]` with fallbacks). Recency-filter: keep `received_ms ≥ now − cycle − 60 s` (the 60-s safe zone covers Gmail's minute-only timestamps). For each survivor, dispatch a real `mousedown/mouseup/click` chain on `.y6/.bog` inside a single `page.evaluate` so DOM re-renders can't detach the locator; URL flips to `#inbox/FMfcgz...`; scrape `div.a3s.aiL` for the full body; navigate back. Returns the partial set on any per-email failure so step 2 can still run on what made it through.
+7. **Step 2 — `classifier.classify_emails(emails)`.** Pure-Python decision, no Chrome. Per email:
+   - `scam_scorer.score_email_dict(...)` → if score ≥ 0.5, label is `["Scam Risk"]` only and we stop (Scam Risk is exclusive).
+   - Else `cv_match.match(body)` returns the top-5 retrieved CV chunks each with `{similarity, topics, kind}`. If max similarity < 0.30 the email is off-topic for this CV → no labels.
+   - Else for each PROJECT chunk above 0.30 similarity, the topics it carries are emitted *if* the email body contains at least one keyword for that topic. Generic CV sections (Skills, Interests, …) carry no topics by design — they only contribute to the similarity score.
+   - Topics not covered by any project (DevOps in this CV) get a direct body-keyword fallback so they can still surface.
+   - Each email's dict is mutated in place to attach the `scam_features` and `cv_match` blocks (used by `history.jsonl` + the dashboard).
+8. **Step 3 — `apply_labels.apply(page, thread_labels)`.** For each `(thread, label)` pair, in isolation:
+   - Tick the row's checkbox via JS on `.oZ-jc` / `[role="checkbox"]`.
+   - Dismiss any leftover Gmail toast, then `force`-click bulk-toolbar `[data-tooltip="More"]`.
+   - Hover `[role="menuitem"]:has-text("Label as")` — `aria-haspopup="true"`, opens on hover not click.
+   - Read `aria-checked` on `[role="menuitemcheckbox"][title="<label>"]`. Skip click if already in desired state (idempotent).
+   - Otherwise `force`-click it (submenu animation defeats Playwright's stability check; click still reaches Gmail).
+   - Escape twice + untick the row before the next pair.
+9. **Append per-email records to `history.jsonl`** — full email + `labels_applied` + `cycle_at`. Streamlit reads this.
+10. **Sleep `--interval` minutes**, loop back to step 6.
+
+If any step raises, the agent's `_run_*` wrapper logs the exception and the cycle continues with whatever it has — partial reads still get classified, classification failures don't block the apply step (it just gets `{}`), apply failures don't block history logging.
 
 ### UI side (parallel)
 
@@ -77,11 +75,10 @@ The number of labels and the number of CV chunks are both **variable** — they 
     - **Sidebar — Agent.** Status (🟢 PID / 🔴 Stopped) + cycle-interval input + Start/Stop buttons. PID tracked in `agent.pid` so state survives Streamlit reruns. Stale PID files (process exited) auto-clean.
     - **Sidebar — Live updates.** Auto-refresh toggle (default on) + 5–60 s interval slider (default 10). Manual Refresh button when paused.
 
-## IPC formats
+## File formats
 
-- `emails.json` — list of `{thread_id, subject, sender, body, received_ms, scam_features, cv_match}`
-- `to_label.json` — `{"thread_labels": {"<thread_id>": ["<label>", ...], ...}}`. Threads with no matching labels are omitted from the dict. Optional — skip writing it to let the local classifier decide.
-- `history.jsonl` — one JSON object per line, same shape as `emails.json` entries plus `labels_applied: [...]` and `cycle_at: "YYYY-MM-DD HH:MM:SS"`.
+- `emails.json` — written by `read_emails.read()` (when called via CLI or for inspection). List of `{thread_id, subject, sender, body, received_ms}`. The orchestrator passes the in-memory list to step 2 directly without round-tripping through disk.
+- `history.jsonl` — append-only, one JSON object per line. Same shape as an emails.json entry plus the `scam_features`, `cv_match`, `labels_applied`, and `cycle_at` fields added during the cycle. The Streamlit dashboard renders from this file.
 
 ## Setup (run once on a new machine)
 
