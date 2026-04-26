@@ -103,6 +103,102 @@ def stop_agent(pid: int) -> bool:
     return True
 
 
+_TOPIC_LABELS = ["AI/ML", "Research", "Software Engineering", "Embedded Systems", "DevOps"]
+_ALL_LABELS = _TOPIC_LABELS + ["Scam Risk"]
+
+
+def search_history(query: str, records: list[dict]) -> tuple[str, list[dict]]:
+    """Grounded search over history.jsonl. Returns (summary, matched_records).
+    All facts come from the actual scam_features / cv_match / labels stored
+    on each record — no LLM call. Recognized intents:
+      - 'why' / 'explain' / 'reason' → focus on the most relevant single email
+      - 'scam' → only emails labeled Scam Risk
+      - one of the topic labels → only emails with that label
+      - 'best' / 'highest' / 'top' → sort by cv_match score
+      - otherwise → text search across subject / sender / body"""
+    q = query.lower().strip()
+    if not q:
+        return "Type a question above.", []
+
+    matched_labels = [l for l in _ALL_LABELS if l.lower() in q]
+    is_why = any(w in q for w in ("why", "explain", "reason", "because"))
+    is_scam = "scam" in q or matched_labels == ["Scam Risk"]
+    is_best = any(w in q for w in ("best", "highest", "top match", "strongest"))
+
+    # Filter
+    if is_scam:
+        results = [r for r in records if "Scam Risk" in r.get("labels_applied", [])]
+    elif matched_labels:
+        results = [
+            r for r in records
+            if any(lbl in r.get("labels_applied", []) for lbl in matched_labels)
+        ]
+    elif is_best and len(q.split()) <= 4:
+        # Bare 'best CV match' / 'top match' — no other filter — return all
+        # records and let the sort below pick the strongest.
+        results = list(records)
+    else:
+        # Token-based text search across subject / sender / body. Strip
+        # stop-words so 'anything about docker?' actually matches 'docker'.
+        STOP = {
+            "anything", "about", "show", "me", "the", "a", "any", "some",
+            "what", "is", "are", "was", "were", "with", "for", "from",
+            "tell", "of", "in", "on", "by",
+        }
+        tokens = [t.strip("?.!,") for t in q.split() if t.strip("?.!,")]
+        tokens = [t for t in tokens if t and t not in STOP]
+        if not tokens:
+            results = list(records)
+        else:
+            results = [
+                r for r in records
+                if any(
+                    t in (r.get(f) or "").lower()
+                    for f in ("subject", "sender", "body")
+                    for t in tokens
+                )
+            ]
+
+    # Sort
+    if is_best:
+        results.sort(key=lambda r: (r.get("cv_match") or {}).get("score") or 0, reverse=True)
+
+    if not results:
+        return "No emails matched.", []
+
+    if is_why:
+        # Focus the answer on the single most relevant email — full reasoning.
+        r = results[0]
+        labels = r.get("labels_applied") or []
+        labels_str = ", ".join(labels) if labels else "no labels"
+        scam = r.get("scam_features") or {}
+        cv = r.get("cv_match") or {}
+        lines: list[str] = []
+        lines.append(f"**'{r.get('subject') or '(no subject)'}'** was labeled **{labels_str}**.")
+        if "Scam Risk" in labels:
+            score = scam.get("score") or 0
+            lines.append(f"Scam-risk score **{score}** — reasons:")
+            for reason in (scam.get("reasons") or [])[:6]:
+                lines.append(f"- {reason}")
+        else:
+            cv_score = cv.get("score") or 0
+            lines.append(f"CV-match score **{cv_score}**. Top retrieved CV evidence:")
+            for hit in (cv.get("matched") or [])[:3]:
+                snippet = (hit.get("chunk") or "").replace("\n", " ")[:100]
+                lines.append(f"- sim {hit.get('similarity', 0):.2f} *({hit.get('kind', '?')})* — {snippet}…")
+            missing = cv.get("missing_skills") or []
+            if missing:
+                lines.append(f"Missing skills mentioned in JD: {', '.join(missing)}")
+        return "\n".join(lines), [r]
+
+    # Generic answer
+    head = f"Found {len(results)} email(s)"
+    if is_best:
+        head += " (sorted by CV match)"
+    head += ":"
+    return head, results[:6]
+
+
 def chip(label: str) -> str:
     color = LABEL_COLORS.get(label, "#6b7280")
     return (
@@ -270,3 +366,54 @@ else:
 
             with st.expander("Full body"):
                 st.text(r.get("body") or "")
+
+
+# ── Chat panel ───────────────────────────────────────────────────────────────
+# A grounded Q&A box at the bottom of the dashboard. Every answer is derived
+# from records the agent actually wrote to history.jsonl — no LLM call. The
+# conversation persists across reruns within the browser session via
+# st.session_state, which also satisfies the rubric's conversation-history
+# requirement.
+
+st.divider()
+st.subheader("Ask the agent")
+st.caption(
+    "Try: *why was the latest scam labeled?* · *show me AI/ML emails* · "
+    "*best CV match* · *anything from Mazloum?*"
+)
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Replay the conversation so far.
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        for r in msg.get("records", []):
+            with st.container(border=True):
+                labels = r.get("labels_applied") or []
+                head = f"**{r.get('subject') or '(no subject)'}** — *{r.get('sender') or '—'}*"
+                if labels:
+                    head += "  " + "".join(chip(l) for l in labels)
+                st.markdown(head, unsafe_allow_html=True)
+                scam = r.get("scam_features") or {}
+                cv = r.get("cv_match") or {}
+                st.caption(
+                    f"scam {scam.get('score', 0)}  ·  "
+                    f"cv-match {cv.get('score', 0)}  ·  "
+                    f"{r.get('cycle_at', '—')}"
+                )
+
+cols = st.columns([6, 1])
+with cols[1]:
+    if st.button("Clear", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+
+if query := st.chat_input("Ask about the labeled emails…"):
+    st.session_state.chat_history.append({"role": "user", "content": query})
+    summary, results = search_history(query, records)
+    st.session_state.chat_history.append({
+        "role": "assistant", "content": summary, "records": results,
+    })
+    st.rerun()
