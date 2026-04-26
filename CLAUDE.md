@@ -90,12 +90,16 @@ cd c:\Users\Yehya\Downloads\LLMIntern
 # Project-local venv
 python -m venv venv
 
-# All deps (playwright, sentence-transformers, streamlit, …)
+# All deps (playwright, sentence-transformers, streamlit, openai, …)
 venv\Scripts\python -m pip install -r requirements.txt
 
 # Playwright Chromium into the project browsers/ directory
 set PLAYWRIGHT_BROWSERS_PATH=c:\Users\Yehya\Downloads\LLMIntern\browsers
 venv\Scripts\python -m playwright install chromium
+
+# Optional — enable the LLM-backed classifier path. Without this var
+# the rule-based path runs and the system still works end-to-end.
+set OPENAI_API_KEY=[INSERT API KEY HERE]
 ```
 
 ## Running
@@ -125,7 +129,8 @@ venv\Scripts\python apply_labels.py --in to_label.json
 - Full-body scrape per fresh email (subject-cell click via real-MouseEvent dispatch).
 - `scam_scorer.py` — heuristic features (sender domain, payment-phrase lexicon incl. `$N fee/charge` regex, no-interview / fast-track signals, generic greetings, suspicious URLs, urgency, hyperbolic comp, all-caps subject), each with a human-readable reason.
 - `cv_match.py` — RAG over CV chunks (sentence-transformers, cosine retrieval, top-k retrieved evidence + missing skills).
-- `classifier.py` — autonomous decision step: scam-first, two-tier RAG voting (high-sim bypass + body-confirm for moderate sim), broader body-keyword safety net for missed labels.
+- `classifier.py` — autonomous decision step. Tries the LLM path first when `OPENAI_API_KEY` is set; falls back to the deterministic rule-based path on any error (missing key, network failure, parse mismatch, …) so the system always works.
+- `llm.py` — single-shot OpenAI call with structured-JSON output. Builds a prompt from the email + scam features + retrieved CV chunks (RAG context) + allowed labels, returns the parsed label list.
 - Per-thread label apply via three-dots → "Label as" → menuitemcheckbox.
 - `history.jsonl` per-cycle log.
 - Streamlit dashboard with auto-refresh + sidebar Start/Stop + free-text filter.

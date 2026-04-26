@@ -10,6 +10,12 @@ numpy>=1.26
 streamlit>=1.40
 streamlit-autorefresh>=1.0
 
+# Optional LLM provider for the classifier's primary path. When
+# OPENAI_API_KEY is set, classifier.py routes label decisions through
+# the LLM with the RAG-retrieved CV chunks + scam features as context.
+# Without a key, the rule-based path runs and the system still works.
+openai>=1.50
+
 # ---------------------------------------------------------------
 # IMPORTANT: Install using python -m pip (not bare pip) to ensure
 # packages land in the same Python that runs the scripts:

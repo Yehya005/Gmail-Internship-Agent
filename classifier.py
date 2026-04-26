@@ -1,24 +1,27 @@
 """Label decisions for one or many emails.
 
-Per the project's labeling-step contract this is where ALL the heavy
-work for a labeling decision lives:
+Per cycle, the classifier:
 
-  1. Run the deterministic scam scorer on the email's full body.
-  2. If scam-risk score >= SCAM_THRESHOLD → ['Scam Risk'] only
-     (per the user rule: Scam Risk is exclusive — no topic labels go
-     on a flagged email).
-  3. Otherwise run the RAG matcher (cv_match) — encode the body,
-     retrieve the top-k most-similar CV chunks.
-  4. If the best chunk-similarity is below CV_MATCH_THRESHOLD, the email
-     is off-topic for this candidate's CV → no labels.
-  5. Otherwise the labels are the *union of topics* from every
-     retrieved chunk above the per-chunk similarity threshold. Each
-     chunk's topics are tagged at CV-load time in cv_match.py — see
-     `_CHUNK_TOPIC_RULES` and `_resolve_chunk_topics` there.
+  1. Runs the deterministic scam scorer on the email's full body.
+  2. If scam-risk score >= SCAM_THRESHOLD → ['Scam Risk'] only.
+     (Scam Risk is exclusive — never combined with topic labels.)
+  3. Otherwise runs the RAG matcher (cv_match) — encode the body,
+     retrieve the top-k most-similar CV chunks (each tagged with
+     topics + 'project' / 'generic' kind at load time).
+  4. If the best chunk-similarity is below CV_MATCH_THRESHOLD, the
+     email is off-topic for this candidate's CV → no labels.
+  5. Decide the topic labels. Two paths share this step:
+        - LLM path (default when OPENAI_API_KEY is set): call
+          llm.decide_labels with the email + scam features + retrieved
+          CV chunks + allowed labels. The LLM returns a JSON list of
+          labels. Falls through to the rule-based path on any error.
+        - Rule-based path: project chunks above CHUNK_VOTE_THRESHOLD
+          emit their tagged topics, with body-keyword confirmation for
+          moderate similarities and a body-keyword safety net for
+          topics no project covers.
 
-Everything is deterministic; no LLM call. The agent imports
-`classify_emails(emails)`; the same module is also runnable from the
-command line via `python classifier.py emails.json`.
+The agent imports `classify_emails(emails)`. The module is also
+runnable from the command line via `python classifier.py emails.json`.
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ import json
 import sys
 from pathlib import Path
 
+import llm
 from cv_match import _CHUNK_TOPIC_RULES, match_dict as cv_match_dict
 from scam_scorer import score_email_dict
 
@@ -38,34 +42,19 @@ HIGH_SIM_THRESHOLD = 0.50    # at/above this, RAG signal is strong enough to
                              # multiple high-scoring chunks for different
                              # topics will multi-label even on terse bodies
 
+# All labels the LLM is allowed to emit. Mirrors gmail_agent.LABELS;
+# duplicated here so the classifier can be invoked standalone (CLI) too.
+ALLOWED_LABELS = [
+    "AI/ML", "Research", "Software Engineering",
+    "Embedded Systems", "DevOps", "Scam Risk",
+]
 
-def classify_email(email: dict) -> list[str]:
-    """Decide labels for one email. **Mutates** the dict in place to add
-    `scam_features` and `cv_match` blocks (used by history.jsonl + UI).
-    Returns the label list — possibly empty."""
-    # 1. Scam scorer (deterministic, no LLM)
-    email["scam_features"] = score_email_dict(email)
-    if (email["scam_features"].get("score") or 0) >= SCAM_THRESHOLD:
-        # 2. Scam Risk is exclusive — never combine with topic labels.
-        email["cv_match"] = {"score": 0.0, "matched": [], "missing_skills": []}
-        return ["Scam Risk"]
 
-    # 3. RAG match against CV chunks
-    body = email.get("body") or ""
-    cv = cv_match_dict(body)
-    email["cv_match"] = cv
-
-    # 4. Threshold gate — off-topic emails get no labels at all
-    if (cv.get("score") or 0) < CV_MATCH_THRESHOLD:
-        return []
-
-    # 5. Topics from PROJECT chunks above the per-chunk threshold,
-    #    confirmed by a keyword match in the email body. Both must hold:
-    #    RAG says "this CV project is relevant" AND the body literally
-    #    mentions the topic. This stops a moderately-similar project
-    #    (e.g. CPU Simulator getting 0.34 cosine) from dragging its
-    #    Software Engineering label onto every tech email — the email
-    #    has to actually be about software engineering for SE to stick.
+def _classify_rule_based(email: dict) -> list[str]:
+    """The deterministic fallback path. Same code that ran before the LLM
+    integration: project chunks vote with body-keyword confirmation,
+    plus a safety net for topics no project covers."""
+    cv = email.get("cv_match") or {}
     body = (email.get("body") or "").lower()
     subject = (email.get("subject") or "").lower()
     text = f" {subject} {body} "
@@ -107,6 +96,49 @@ def classify_email(email: dict) -> list[str]:
             labels.add(topic)
 
     return sorted(labels)
+
+
+def classify_email(email: dict) -> list[str]:
+    """Decide labels for one email. **Mutates** the dict in place to add
+    `scam_features` and `cv_match` blocks (used by history.jsonl + UI).
+    Returns the label list — possibly empty.
+
+    Tries the LLM path first when OPENAI_API_KEY is set; on any LLM
+    failure (missing key, network error, parse error, schema mismatch)
+    silently falls back to the deterministic rule-based logic."""
+    # 1. Scam scorer (deterministic, runs in both paths).
+    email["scam_features"] = score_email_dict(email)
+    if (email["scam_features"].get("score") or 0) >= SCAM_THRESHOLD:
+        # Scam Risk is exclusive — never combine with topic labels.
+        # No need to run RAG / LLM for a clearly-scam email.
+        email["cv_match"] = {"score": 0.0, "matched": [], "missing_skills": []}
+        return ["Scam Risk"]
+
+    # 2. RAG retrieval (deterministic). Always run so the dashboard +
+    #    history.jsonl get the cv_match block, and so the LLM has
+    #    grounded evidence to reason from.
+    body = email.get("body") or ""
+    cv = cv_match_dict(body)
+    email["cv_match"] = cv
+
+    # 3. Off-topic gate.
+    if (cv.get("score") or 0) < CV_MATCH_THRESHOLD:
+        return []
+
+    # 4. Try the LLM path first; fall back to the rule-based one on any
+    #    failure. Both paths see the same data (email + scam_features +
+    #    retrieved cv_match), and both honour the same rules — Scam Risk
+    #    exclusivity, off-topic returns [], multi-label is fine when the
+    #    email genuinely spans multiple topics.
+    if llm.llm_available():
+        try:
+            return llm.decide_labels(
+                email, email["scam_features"], cv, ALLOWED_LABELS,
+            )
+        except Exception as e:
+            print(f"  [classifier] LLM path failed ({e}); falling back to rules.")
+
+    return _classify_rule_based(email)
 
 
 def classify_emails(emails: list[dict]) -> dict[str, list[str]]:
