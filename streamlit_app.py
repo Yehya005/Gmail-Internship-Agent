@@ -12,13 +12,24 @@ Run from a second terminal while the agent is running:
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-HISTORY = Path(__file__).parent / "history.jsonl"
+PROJECT = Path(__file__).parent
+HISTORY = PROJECT / "history.jsonl"
+PID_FILE = PROJECT / "agent.pid"
+AGENT_LOG = PROJECT / "agent_output.log"
+# Use the venv python so the spawned agent has playwright + sentence-transformers.
+VENV_PY = PROJECT / "venv" / ("Scripts" if os.name == "nt" else "bin") / (
+    "python.exe" if os.name == "nt" else "python"
+)
 
 LABEL_COLORS = {
     "AI/ML":                "#7c3aed",   # purple
@@ -43,6 +54,53 @@ def load_records() -> list[dict]:
         except json.JSONDecodeError:
             continue
     return out
+
+
+def agent_status() -> tuple[bool, int | None]:
+    """Return (is_running, pid). Auto-cleans a stale PID file."""
+    if not PID_FILE.exists():
+        return False, None
+    try:
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        PID_FILE.unlink(missing_ok=True)
+        return False, None
+    try:
+        # Signal 0 = liveness probe — raises if the process no longer exists.
+        os.kill(pid, 0)
+        return True, pid
+    except OSError:
+        PID_FILE.unlink(missing_ok=True)
+        return False, None
+
+
+def start_agent(interval_min: float) -> int:
+    """Spawn gmail_agent.py in the background. Returns the new PID."""
+    # Append to the same log the standalone runs use.
+    log_handle = AGENT_LOG.open("a", encoding="utf-8")
+    creationflags = (
+        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    )
+    proc = subprocess.Popen(
+        [str(VENV_PY), "-u", "gmail_agent.py", "--interval", str(interval_min)],
+        cwd=str(PROJECT),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+    PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+    return proc.pid
+
+
+def stop_agent(pid: int) -> bool:
+    """Kill the agent process by PID. Returns True if the kill went through."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    PID_FILE.unlink(missing_ok=True)
+    return True
 
 
 def chip(label: str) -> str:
@@ -73,10 +131,31 @@ st.set_page_config(
 st.title("Gmail Internship Monitor")
 st.caption("Live view of every email the agent has scanned, classified, and labeled.")
 
-# Auto-refresh: poll history.jsonl on a timer so new cycles appear without
-# manually clicking Refresh. The toggle + interval slider live in the
-# sidebar so the user can disable polling during a demo if needed.
+# Sidebar — agent process control + auto-refresh settings.
 with st.sidebar:
+    st.subheader("Agent")
+    running, pid = agent_status()
+    if running:
+        st.success(f"🟢 Running  ·  PID {pid}")
+        if st.button("Stop agent", type="secondary", use_container_width=True):
+            if stop_agent(pid):
+                st.toast("Stopped.", icon="🛑")
+            else:
+                st.toast("Process already gone.", icon="⚠️")
+            st.rerun()
+    else:
+        st.error("🔴 Stopped")
+        cycle_min = st.number_input(
+            "Cycle interval (minutes)",
+            min_value=0.5, max_value=30.0, value=2.0, step=0.5,
+        )
+        if st.button("Start agent", type="primary", use_container_width=True):
+            new_pid = start_agent(float(cycle_min))
+            st.toast(f"Started (PID {new_pid}).", icon="▶️")
+            st.rerun()
+
+    st.divider()
+
     st.subheader("Live updates")
     auto = st.toggle("Auto-refresh", value=True)
     interval_s = st.slider(
