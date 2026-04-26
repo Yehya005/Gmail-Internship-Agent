@@ -1,6 +1,11 @@
 # Browser automation — controls a Chromium window to interact with Gmail
 playwright==1.58.0
 
+# RAG — semantic embeddings for CV–JD matching (cv_match.py).
+# all-MiniLM-L6-v2 (~80 MB) runs on CPU, downloaded on first use.
+sentence-transformers>=3.0
+numpy>=1.26
+
 # ---------------------------------------------------------------
 # IMPORTANT: Install using python -m pip (not bare pip) to ensure
 # packages land in the same Python that runs the scripts:

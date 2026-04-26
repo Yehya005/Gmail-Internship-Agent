@@ -41,6 +41,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 
 from scam_scorer import score_email_dict
+from cv_match import get_matcher, match_dict as cv_match_dict
 
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
@@ -276,13 +277,18 @@ async def _scan_inbox(page: Page) -> list[dict]:
                 const snippet = snippetEl?.innerText?.trim() || '';
 
                 // Received timestamp from the date column's tooltip.
-                // Format: "Sat, 25 Apr 2026, 16:11" — drop the comma before
-                // the time so Date.parse treats it as RFC2822-ish.
+                // Format usually: "Sat, 25 Apr 2026, 16:11" — drop the
+                // comma before the time so Date.parse treats it as
+                // RFC2822-ish. Fallbacks: try the visible cell text, and
+                // if everything fails, use Date.now() so the email is
+                // *kept* (we'd rather double-scan than silently drop a
+                // recent email whose tooltip didn't parse).
                 const dateEl = row.querySelector('td.xW span[title]');
                 const titleStr = dateEl?.getAttribute('title') || '';
-                const cleaned = titleStr.replace(/,\\s*(\\d{1,2}:\\d{2})/, ' $1');
-                const parsed = cleaned ? Date.parse(cleaned) : NaN;
-                const received_ms = Number.isFinite(parsed) ? parsed : null;
+                const visibleStr = dateEl?.innerText?.trim() || '';
+                let parsed = Date.parse(titleStr.replace(/,\\s*(\\d{1,2}:\\d{2})/, ' $1'));
+                if (!Number.isFinite(parsed)) parsed = Date.parse(visibleStr);
+                const received_ms = Number.isFinite(parsed) ? parsed : Date.now();
 
                 results.push({ thread_id: id, subject, sender, body: snippet, received_ms });
                 if (results.length >= limit) break;
@@ -508,7 +514,11 @@ async def main() -> None:
     if args.interval <= 0:
         raise SystemExit("--interval must be positive")
     CYCLE_INTERVAL_SECONDS = int(args.interval * 60)
-    DECISION_TIMEOUT_SECONDS = max(30, CYCLE_INTERVAL_SECONDS // 2)
+    # Give Claude Code (the LLM) at least 90 s to read emails.json and write
+    # to_label.json — short cycles otherwise time out before classification
+    # finishes, especially when the email body + cv_match + scam_features
+    # all need to be read together.
+    DECISION_TIMEOUT_SECONDS = max(90, CYCLE_INTERVAL_SECONDS // 2)
 
     print("=== Gmail Internship Monitor ===")
     print(f"Cycle: {args.interval:g} min  ·  IPC wait: {DECISION_TIMEOUT_SECONDS}s\n")
@@ -536,7 +546,13 @@ async def main() -> None:
         missing = await _verify_labels(page)
         if missing:
             raise RuntimeError(f"Labels missing after creation: {missing}")
-        print(f"  VERIFIED: all {len(LABELS)} labels exist.\n")
+        print(f"  VERIFIED: all {len(LABELS)} labels exist.")
+
+        # Warm up the embedding model + CV chunks so cycle 1 doesn't stall
+        # on the first cv_match call (model load is ~1-3s on CPU).
+        print("  Loading CV-match embedding model...")
+        m = get_matcher()
+        print(f"  CV indexed as {len(m.chunks)} chunks.\n")
 
         # ── Step 4: monitoring loop ──────────────────────────────────────────
         mins = CYCLE_INTERVAL_SECONDS / 60
@@ -549,13 +565,14 @@ async def main() -> None:
 
             all_emails = await _scan_inbox(page)
 
-            # Keep only emails received within the last cycle window.
-            # Gmail's per-row timestamp tooltip has minute precision only
-            # ("Sun, 26 Apr 2026, 11:20"), which JS Date.parse turns into
-            # 11:20:00 — losing up to 59s of resolution. Subtract 60s of
-            # grace so a minute-rounded email straddling the cutoff isn't
-            # dropped. The same email may appear in two consecutive cycles
-            # but Gmail's label-apply is idempotent so duplication is safe.
+            # Recency window: cycle length + a 1-minute safe zone. So a
+            # 2-min cycle accepts emails from the last 3 min, and a 10-min
+            # cycle accepts the last 11 min. The safe zone covers two
+            # things at once: (a) Gmail's tooltip has minute precision so
+            # an email actually received at 11:20:55 reads as 11:20:00,
+            # and (b) edge cases where an email lands between the scan
+            # call and the cycle's clock read. Re-scanning the same email
+            # in two consecutive cycles is safe — labelling is idempotent.
             now_ms = time.time() * 1_000
             cutoff_ms = now_ms - CYCLE_INTERVAL_SECONDS * 1_000 - 60_000
             new_emails = [
@@ -574,12 +591,17 @@ async def main() -> None:
                 # Open each fresh email and replace the row-snippet body with
                 # the full message text, then re-run the scam scorer. Snippet
                 # alone is ~100 chars and lets scammers bury the payload.
-                print("  Reading full bodies...")
+                # Also compute the CV-match block (RAG over chunked CV) so
+                # Claude Code sees matched-evidence + missing-skills when
+                # deciding which topic labels to apply.
+                print("  Reading full bodies + scoring CV match...")
                 for e in new_emails:
                     full = await _open_and_get_full_body(page, e["thread_id"])
                     if full:
                         e["body"] = full
                         e["scam_features"] = score_email_dict(e)
+                    # Use whatever body we have (full or snippet) for the match.
+                    e["cv_match"] = cv_match_dict(e.get("body") or "")
 
                 EMAILS_FILE.write_text(
                     json.dumps(new_emails, indent=2, ensure_ascii=False), encoding="utf-8"
