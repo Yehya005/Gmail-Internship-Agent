@@ -42,6 +42,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from scam_scorer import score_email_dict
 from cv_match import get_matcher, match_dict as cv_match_dict
+from classifier import classify_email
 
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
@@ -471,8 +472,13 @@ async def _apply_labels_from_inbox(
 
 # ── IPC ──────────────────────────────────────────────────────────────────────
 
-async def _wait_for_decisions() -> dict[str, list[str]]:
-    """Read to_label.json and return {thread_id: [label_name, ...]}."""
+async def _wait_for_decisions() -> tuple[dict[str, list[str]], bool]:
+    """Read to_label.json and return ({thread_id: [labels]}, timed_out).
+
+    `timed_out=True` means the file never appeared — main loop should fall
+    back to the local classifier. `timed_out=False` with an empty dict
+    means the LLM explicitly chose to label nothing (don't override).
+    """
     if DECISION_TIMEOUT_SECONDS >= 60:
         wait_str = f"{DECISION_TIMEOUT_SECONDS // 60} min"
     else:
@@ -490,12 +496,11 @@ async def _wait_for_decisions() -> dict[str, list[str]]:
                     f"  Received {len(thread_labels)} thread(s) "
                     f"with {pair_count} label(s) total."
                 )
-                return thread_labels
+                return thread_labels, False
             except Exception:
                 pass
         await asyncio.sleep(2)
-    print("  Timed out — skipping labeling this cycle.")
-    return {}
+    return {}, True
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -612,7 +617,20 @@ async def main() -> None:
                 print(f"\nemails.json written ({len(new_emails)} emails).")
                 print("CLAUDE: please read emails.json, analyze, and write to_label.json.")
 
-                thread_labels = await _wait_for_decisions()
+                thread_labels, timed_out = await _wait_for_decisions()
+                if timed_out:
+                    # No LLM/Claude Code in the loop — fall back to the
+                    # local rule-based classifier (scam-first, then topic
+                    # keywords gated on cv_match score).
+                    thread_labels = {
+                        e["thread_id"]: lbls
+                        for e in new_emails
+                        if (lbls := classify_email(e))
+                    }
+                    print(
+                        f"  No to_label.json — auto-classified "
+                        f"{len(thread_labels)} thread(s) locally."
+                    )
 
                 applied, requested = await _apply_labels_from_inbox(
                     page, thread_labels
