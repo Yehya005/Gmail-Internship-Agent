@@ -37,7 +37,11 @@ from scam_scorer import score_email_dict
 
 SCAM_THRESHOLD = 0.5
 CV_MATCH_THRESHOLD = 0.30
-CHUNK_VOTE_THRESHOLD = 0.30  # only chunks at least this similar vote topics
+CHUNK_VOTE_THRESHOLD = 0.30  # minimum sim for a project chunk to vote at all
+HIGH_SIM_THRESHOLD = 0.50    # at/above this, RAG signal is strong enough to
+                             # bypass the body-keyword confirmation step —
+                             # multiple high-scoring chunks for different
+                             # topics will multi-label even on terse bodies
 
 
 def _uncovered_topics() -> set[str]:
@@ -83,9 +87,17 @@ def classify_email(email: dict) -> list[str]:
     for hit in cv.get("matched", []):
         if hit.get("kind") != "project":
             continue
-        if (hit.get("similarity") or 0) < CHUNK_VOTE_THRESHOLD:
+        sim = hit.get("similarity") or 0
+        if sim < CHUNK_VOTE_THRESHOLD:
             continue
         for topic in hit.get("topics") or []:
+            if sim >= HIGH_SIM_THRESHOLD:
+                # Strong RAG signal — multi-label even if the body is terse
+                labels.add(topic)
+                continue
+            # Moderate signal — keep the body-keyword guard so generic
+            # noise (e.g. CPU Simulator at 0.34 sim) can't drag its
+            # Software Engineering label onto every tech email.
             keywords = _CHUNK_TOPIC_RULES.get(topic, [])
             if any(kw in text for kw in keywords):
                 labels.add(topic)
