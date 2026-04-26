@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 HISTORY = Path(__file__).parent / "history.jsonl"
 
@@ -71,6 +72,22 @@ st.set_page_config(
 )
 st.title("Gmail Internship Monitor")
 st.caption("Live view of every email the agent has scanned, classified, and labeled.")
+
+# Auto-refresh: poll history.jsonl on a timer so new cycles appear without
+# manually clicking Refresh. The toggle + interval slider live in the
+# sidebar so the user can disable polling during a demo if needed.
+with st.sidebar:
+    st.subheader("Live updates")
+    auto = st.toggle("Auto-refresh", value=True)
+    interval_s = st.slider(
+        "Interval (seconds)", min_value=5, max_value=60, value=10, step=5,
+        disabled=not auto,
+    )
+    if auto:
+        st_autorefresh(interval=interval_s * 1000, key="cycle_refresh")
+        st.caption(f"Refreshing every {interval_s}s.")
+    else:
+        st.caption("Paused — use the Refresh button.")
 
 records = load_records()
 records.sort(key=lambda r: r.get("received_ms") or 0, reverse=True)

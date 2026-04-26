@@ -8,6 +8,7 @@ numpy>=1.26
 
 # UI — dashboard reads history.jsonl produced by gmail_agent.py.
 streamlit>=1.40
+streamlit-autorefresh>=1.0
 
 # ---------------------------------------------------------------
 # IMPORTANT: Install using python -m pip (not bare pip) to ensure
