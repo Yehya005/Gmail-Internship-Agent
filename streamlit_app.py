@@ -23,6 +23,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 import account
+import llm
 
 PROJECT = Path(__file__).parent
 PID_FILE = PROJECT / "agent.pid"
@@ -238,9 +239,15 @@ st.set_page_config(
 st.title("Gmail Internship Monitor")
 _active_email = account.get_active_email()
 _active_history = account.get_active_history_path()
+_provider = llm._provider()
+_provider_label = {
+    "anthropic": "🧠 Claude (Anthropic)",
+    "openai":    "🧠 GPT (OpenAI)",
+}.get(_provider, "⚙️ Rule-based fallback")
 if _active_email:
     st.caption(
-        f"Monitoring **{_active_email}**  ·  history: `{_active_history.name}`"
+        f"Monitoring **{_active_email}**  ·  history: `{_active_history.name}`  ·  "
+        f"classifier: **{_provider_label}**"
     )
 else:
     st.caption(

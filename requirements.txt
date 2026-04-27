@@ -10,10 +10,11 @@ numpy>=1.26
 streamlit>=1.40
 streamlit-autorefresh>=1.0
 
-# Optional LLM provider for the classifier's primary path. When
-# OPENAI_API_KEY is set, classifier.py routes label decisions through
-# the LLM with the RAG-retrieved CV chunks + scam features as context.
-# Without a key, the rule-based path runs and the system still works.
+# LLM providers for the classifier's primary path. classifier.py routes
+# label decisions through whichever is available — checks ANTHROPIC_API_KEY
+# first (preferred), then OPENAI_API_KEY. Without either, the rule-based
+# path runs and the system still works.
+anthropic>=0.40
 openai>=1.50
 
 # ---------------------------------------------------------------
