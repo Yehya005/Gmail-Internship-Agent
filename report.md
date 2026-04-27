@@ -1,6 +1,6 @@
 # A Candidate-Side, Inbox-Grounded LLM Agent for Internship Email Triage with Retrieval-Augmented CV Matching and a Deterministic Scam Classifier
 
-**Author:** Yehya Mazloum
+**Authors:** Yehya Mazloum, Karim Koiak, Mohamed Darwish, Ayla Abedelsater
 **Affiliation:** Department of Computer Engineering, Lebanese American University
 **Course:** COE548/748 — Specialized LLM Agent
 
@@ -183,7 +183,18 @@ Future work: (1) extend the candidate-side RAG to retrieve the candidate's own p
 
 ## Author Contributions
 
-Yehya Mazloum: full project — design, implementation, evaluation, and writing.
+All four authors contributed to the project's design, evaluation, and the
+writing of this report. Specific responsibilities:
+
+- **Yehya Mazloum** — system architecture, Gmail browser-automation
+  pipeline, RAG retrieval (`cv_match.py`), LLM integration (`llm.py`),
+  Streamlit dashboard, repository maintenance.
+- **Karim Koiak** — scam-risk heuristic design and lexicon curation,
+  evaluation on the crafted internship-scam test set.
+- **Mohamed Darwish** — literature review and related-work synthesis,
+  IEEE report drafting and formatting.
+- **Ayla Abedelsater** — dashboard chat-panel design, end-to-end testing
+  on the live inbox, demo preparation.
 
 ---
 
