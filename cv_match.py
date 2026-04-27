@@ -132,7 +132,7 @@ def _cv_has_skill(skill: str, cv_text_lower: str) -> bool:
 
 _CHUNK_TOPIC_RULES: dict[str, list[str]] = {
     "AI/ML": [
-        "deep learning", "machine learning", "ml", "ai/ml",
+        "deep learning", "machine learning", "ml", "ai/ml", "ai",
         "tensorflow", "pytorch", "keras", "nlp", "transformer", "cnn",
         "neural network", "artificial intelligence",
     ],
@@ -161,6 +161,15 @@ _GENERIC_SECTION_PREFIXES = (
 )
 
 
+def kw_match(keyword: str, text: str) -> bool:
+    """Word-boundary substring match. Lets short keywords like 'ai' or
+    'ml' match real occurrences ('in ai.', 'using ml.') without firing
+    on 'email' / 'html'. Multi-word keywords ('deep learning') and
+    keywords with embedded slashes ('ai/ml', 'ci/cd') still work because
+    `\\b` sits between word and non-word characters."""
+    return re.search(rf"\b{re.escape(keyword)}\b", text) is not None
+
+
 def _is_generic(chunk_text: str) -> bool:
     head = chunk_text.split("\n", 1)[0].lower()
     if any(head.startswith(p) for p in _GENERIC_SECTION_PREFIXES):
@@ -173,7 +182,7 @@ def _raw_chunk_topics(chunk_text: str) -> list[str]:
     text = chunk_text.lower()
     out: list[str] = []
     for topic, kws in _CHUNK_TOPIC_RULES.items():
-        if any(kw in text for kw in kws):
+        if any(kw_match(kw, text) for kw in kws):
             out.append(topic)
     return out
 

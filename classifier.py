@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 import llm
-from cv_match import _CHUNK_TOPIC_RULES, match_dict as cv_match_dict
+from cv_match import _CHUNK_TOPIC_RULES, kw_match, match_dict as cv_match_dict
 from scam_scorer import score_email_dict
 
 SCAM_THRESHOLD = 0.5
@@ -75,7 +75,7 @@ def _classify_rule_based(email: dict) -> list[str]:
             # noise (e.g. CPU Simulator at 0.34 sim) can't drag its
             # Software Engineering label onto every tech email.
             keywords = _CHUNK_TOPIC_RULES.get(topic, [])
-            if any(kw in text for kw in keywords):
+            if any(kw_match(kw, text) for kw in keywords):
                 labels.add(topic)
 
     # 6. Body-keyword safety net: for any topic NOT already emitted, add
@@ -92,7 +92,7 @@ def _classify_rule_based(email: dict) -> list[str]:
     for topic, keywords in _CHUNK_TOPIC_RULES.items():
         if topic in labels:
             continue
-        if any(kw in text for kw in keywords):
+        if any(kw_match(kw, text) for kw in keywords):
             labels.add(topic)
 
     return sorted(labels)
