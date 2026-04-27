@@ -159,18 +159,24 @@ def _launch_dashboard() -> str | None:
 
 async def main() -> int:
     email = await _wait_for_login_and_detect_email()
+    # Hard rule: the dashboard only opens AFTER the user has signed in
+    # and we know which account we're monitoring. Otherwise the UI would
+    # land on the wrong (or legacy) history file. On login failure, exit
+    # without launching anything — the user can re-run the script.
     if not email:
-        print("warning: couldn't detect account — dashboard will use the "
-              "legacy history.jsonl.")
+        print("error: login not detected — not launching the dashboard. "
+              "Re-run start_monitoring.py and sign in within 5 minutes.",
+              file=sys.stderr)
+        return 1
+
+    set_active_email(email)
+    history_file = history_path_for(email)
+    if history_file.exists():
+        print(f"Welcome back — using existing history "
+              f"({history_file.name}, {history_file.stat().st_size} bytes)")
     else:
-        set_active_email(email)
-        history_file = history_path_for(email)
-        if history_file.exists():
-            print(f"Welcome back — using existing history "
-                  f"({history_file.name}, {history_file.stat().st_size} bytes)")
-        else:
-            print(f"First time monitoring this account — "
-                  f"fresh history at {history_file.name}")
+        print(f"First time monitoring this account — "
+              f"fresh history at {history_file.name}")
 
     print("Launching dashboard...")
     url = _launch_dashboard()
