@@ -12,6 +12,7 @@ agent_output.log
 
 # Per-cycle history fed into the Streamlit dashboard (real email content)
 history.jsonl
+history_*.jsonl.bak
 
 # Agent process tracking — written by the dashboard's Start/Stop buttons
 agent.pid
