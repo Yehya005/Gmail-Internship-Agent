@@ -71,10 +71,13 @@ def agent_status() -> tuple[bool, int | None]:
         PID_FILE.unlink(missing_ok=True)
         return False, None
     try:
-        # Signal 0 = liveness probe — raises if the process no longer exists.
+        # Signal 0 = liveness probe. On POSIX this is a clean no-op-or-OSError.
+        # On Windows, os.kill against a bogus PID can raise SystemError
+        # ("returned a result with an exception set") instead of OSError, so
+        # catch broadly — any failure means the PID is unusable, treat as stale.
         os.kill(pid, 0)
         return True, pid
-    except OSError:
+    except Exception:
         PID_FILE.unlink(missing_ok=True)
         return False, None
 
