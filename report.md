@@ -8,7 +8,7 @@
 
 ## Abstract
 
-Existing job-search and email-triage systems split along a recurring fault line: tools that automate applications ignore the inbox, and tools that triage email ignore job semantics. Both leave the candidate to manually scan recruiter messages for relevant offers and obvious scams. We present a personal LLM agent that fills that gap. The agent monitors the candidate's Gmail inbox over the Chrome DevTools Protocol, scrapes each fresh message's full body, scores it with a deterministic rule-based scam classifier, and retrieves matching evidence from the candidate's CV via cosine similarity over sentence-transformer embeddings of CV chunks. A label-decision step — backed by an LLM with structured-JSON output, with a deterministic fallback when no API key is configured — emits one or more labels per email from a configurable set (`AI/ML`, `Research`, `Software Engineering`, `Embedded Systems`, `DevOps`, `Scam Risk`). Labels are applied directly in Gmail per-thread, and the per-cycle history feeds a Streamlit dashboard with a chat panel grounded in the agent's own records. End-to-end tests on 11 crafted internship emails reach 11/11 correct label sets, including buried-payload scam detection at 0.55 confidence on a single regex match. The system runs offline with no API key, and the LLM path is opt-in via an environment variable.
+Existing job-search and email-triage systems split along a recurring fault line: tools that automate applications ignore the inbox, and tools that triage email ignore job semantics. Both leave the candidate to manually scan recruiter messages for relevant offers and obvious scams. We present a personal LLM agent that fills that gap. The agent monitors the candidate's Gmail inbox over the Chrome DevTools Protocol, scrapes each fresh message's full body, scores it with a deterministic rule-based scam classifier, and retrieves matching evidence from the candidate's CV via cosine similarity over sentence-transformer embeddings of CV chunks. A label-decision step — backed by an LLM with enum-constrained structured output, with a deterministic fallback when no provider is configured — emits one or more labels per email from a configurable set (`AI/ML`, `Research`, `Software Engineering`, `Embedded Systems`, `DevOps`, `Scam Risk`). The LLM layer routes through whichever provider the candidate has available: Anthropic's Claude via the standalone `claude -p` CLI billed against an existing Pro/Max subscription (no API-key billing), Anthropic's API directly, or OpenAI's API. Labels are applied directly in Gmail per-thread, the dashboard's caption surfaces which classifier is live, and the per-cycle history — partitioned per Gmail account — feeds a Streamlit dashboard with a chat panel grounded in the agent's own records. End-to-end tests on 11 crafted internship emails reach 11/11 correct label sets, including buried-payload scam detection at 0.55 confidence on a single regex match. The system runs offline with no provider configured, and the LLM path is opt-in via a single environment variable.
 
 **Index Terms** — LLM agent, retrieval-augmented generation, email classification, internship matching, scam detection, browser automation.
 
@@ -75,15 +75,15 @@ The agent is structured as a thin orchestrator (`gmail_agent.py`) calling three 
                                        ▼
 read_emails.py ──> emails ──> classifier.py ──> apply_labels.py ──> Gmail
                                   │
-                                  └─ llm.py (OpenAI, optional)
+                                  └─ llm.py — claude_cli │ anthropic │ openai
                                        │
                                        ▼
-                                history.jsonl
+                          history_<email>.jsonl  (per-account)
                                        │
                                        ▼
                           streamlit_app.py (dashboard + chat)
 ```
-**Fig. 1.** Per-cycle data flow.
+**Fig. 1.** Per-cycle data flow. The LLM layer in `llm.py` selects a provider at runtime from environment variables; classification falls back to a deterministic rule-based path when no provider is configured. History is partitioned per Gmail account so re-monitoring a previously-seen account picks up its prior records.
 
 A cold start handles connection to the user's existing Chrome over CDP port 9222 (or launches a fresh Chrome with a temp profile if none is running), waits for manual login, idempotently creates each topic label in Gmail's sidebar, and warm-loads the embedding model. The monitoring loop then runs at the user's chosen interval (default 2 minutes), with each step wrapped in a `try`/`except` boundary so a single-step failure cannot kill the cycle.
 
@@ -95,7 +95,13 @@ A cold start handles connection to the user's existing Chrome over CDP port 9222
 
 **Tool 3 — `cv_match.py` (RAG with vector embeddings).** At load time the candidate's CV (`plan.txt`) is split into semantic chunks (one per heading + one per project bullet), each chunk is tagged with topic labels via a small keyword rule table, and each chunk is encoded with `sentence-transformers all-MiniLM-L6-v2` into a 384-dim normalized vector. At inference time the email body is encoded, cosine-compared against the cached chunk embeddings, and the top-k (k=5) chunks are returned alongside their topic tags and `kind` (`project` vs `generic`).
 
-**Tool 4 — `llm.py` (OpenAI integration).** Optional augment. Builds a prompt with the email + scam features + retrieved CV chunks + allowed labels and calls the OpenAI Chat Completions API with `response_format={"type": "json_schema", "strict": true}` so the parsed output is guaranteed to be `{"labels": [<one of allowed>, …]}`. The schema's `enum` constraint over the label vocabulary directly addresses the multi-label calibration issue raised in [6]. Reads `OPENAI_API_KEY` from the environment; the classifier catches any exception and silently falls back to the rule-based path.
+**Tool 4 — `llm.py` (multi-provider LLM integration).** Optional augment, but the *primary* path whenever a provider is configured. The same prompt — email + scam features + retrieved CV chunks + full CV + allowed-label list — is dispatched to one of three back-ends, picked by environment variable in priority order:
+
+1. **Claude via subscription (`claude_cli`)**. When `CLAUDE_CODE_OAUTH_TOKEN` is set and the standalone `claude` CLI is on PATH, `llm.py` shells out to `claude -p --output-format text --dangerously-skip-permissions`, passing the prompt on stdin. Billing is consumed against the user's existing Claude Pro / Max subscription; no API-key spend. Output is constrained via a strict-JSON instruction in the prompt and post-validated against the allowed-label vocabulary, with markdown-fence stripping for robustness.
+2. **Anthropic API (`anthropic`)**. When `ANTHROPIC_API_KEY` is set, `llm.py` calls the Messages API with a forced tool-use call (`tool_choice={"type": "tool", "name": "submit_labels"}`) whose `input_schema` enums the allowed labels. The model can only emit values from the label vocabulary by construction.
+3. **OpenAI API (`openai`)**. When `OPENAI_API_KEY` is set, `llm.py` calls Chat Completions with `response_format={"type": "json_schema", "strict": true}` — the same enum constraint, expressed in OpenAI's structured-output syntax.
+
+All three paths use `temperature=0` (or equivalent) and feed exactly the same RAG-grounded context. The enum constraint in paths 2 and 3 directly addresses the multi-label calibration issue raised in [6] by eliminating any out-of-vocabulary token; path 1 enforces the same vocabulary post-hoc. The classifier wraps the call in `try`/`except` and silently falls back to the rule-based path on any failure (missing provider, network error, parse failure, schema mismatch). The dashboard caption surfaces which path is live so the demo viewer can verify the agent is on the LLM path: 🧠 *Claude (Pro subscription)* / 🧠 *Claude (Anthropic API)* / 🧠 *GPT (OpenAI)* / ⚙️ *Rule-based fallback*.
 
 ### C. Per-Cycle Flow
 
@@ -122,7 +128,10 @@ A Streamlit dashboard (`streamlit_app.py`) reads `history.jsonl` and renders one
 ### A. Models
 
 - **Embedding model:** `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~80 MB, runs on CPU).
-- **LLM (optional path):** `gpt-4o-mini` with `response_format=json_schema` and `temperature=0`. Selectable via `LLM_MODEL` env var.
+- **LLM (optional path).** One of:
+  - **Claude (default, subscription path).** `claude-haiku-4-5` invoked via `claude -p`; billed against a Pro/Max subscription rather than API credits. Switchable to Sonnet via `claude` CLI configuration.
+  - **Claude (direct API).** `claude-haiku-4-5-20251001` via the Anthropic Messages API with a forced tool-use enum. Selectable via `ANTHROPIC_MODEL` env var.
+  - **OpenAI.** `gpt-4o-mini` with `response_format=json_schema` and `temperature=0`. Selectable via `OPENAI_MODEL` env var.
 
 ### B. Datasets
 
@@ -140,8 +149,9 @@ The crafted emails are versioned in the test harness and re-runnable across regr
 
 The LLM system prompt is reproduced verbatim in `llm.py`. Key design decisions:
 
-- **Pre-tool-calling.** Instead of giving the LLM tool access at runtime (which adds latency and costs), the deterministic tools (`scam_scorer`, `cv_match`) are called *before* the LLM and their outputs are inlined as context. The LLM is reduced to a single decision call, which is fast (~1–3 s on `gpt-4o-mini`) and cheap (~$0.00025/email at current OpenAI prices).
+- **Pre-tool-calling.** Instead of giving the LLM tool access at runtime (which adds latency and costs), the deterministic tools (`scam_scorer`, `cv_match`) are called *before* the LLM and their outputs are inlined as context. The LLM is reduced to a single decision call. Per-email latency: ~1–3 s on the direct Anthropic / OpenAI APIs; ~7–10 s on the Claude CLI subprocess path (the cost of a Node.js cold-start per call). Per-email money cost: ~$0.00025 on `gpt-4o-mini`, ~$0.0008 on Anthropic's `claude-haiku-4-5`, and **zero** on the subscription path — that path consumes the user's existing Claude Pro / Max quota rather than API credit, which is the practical reason it ships as the default.
 - **Two-tier RAG voting in the rule path.** Project chunks at similarity ≥ 0.50 emit their topics directly; chunks at 0.30–0.50 require body-keyword confirmation. A body-keyword safety net adds any topic not yet emitted whose keyword is literally present in the body. This stops a moderately-similar generic project (e.g. the candidate's CPU Simulator at 0.34 cosine for a `Docker + Linux` query) from dragging Software Engineering onto every tech email.
+- **Word-boundary keyword matching.** All keyword tests against email bodies (the rule-path safety net and the chunk-tagging table in `cv_match.py`) use a `\b{kw}\b` regex via the shared `kw_match()` helper. Bare keywords like `ai` or `ml` would otherwise miss real occurrences (`We offer internship in ai.` has no surrounding spaces around the `ai` token at end-of-sentence) or false-fire on substrings (`email`, `html`, `available`).
 - **Recency safe-zone.** The recency filter uses `cycle_interval + 60 s` because Gmail's row tooltip is minute-precision; an email received at 11:20:55 reads as 11:20:00 and would otherwise be dropped at a cycle boundary. The dedup `seen` set, loaded from `history.jsonl` at startup, prevents the safe zone from re-processing already-handled emails.
 
 ### D. Evaluation Metrics
@@ -175,7 +185,7 @@ The single biggest mistake in the development process — over-labeling the enti
 
 ## VI. Conclusion and Future Work
 
-We presented a personal LLM agent that monitors a candidate's Gmail inbox and labels internship emails by topic, grounded in retrieved CV chunks and paired with a deterministic scam classifier. The system runs offline by default; an OpenAI-backed path is opt-in. End-to-end correctness on a crafted regression set is 11/11, with the most interesting failures (buried scams, multi-domain matches) handled cleanly via a two-tier RAG voting rule and a body-keyword safety net.
+We presented a personal LLM agent that monitors a candidate's Gmail inbox and labels internship emails by topic, grounded in retrieved CV chunks and paired with a deterministic scam classifier. The label decision is dispatched to whichever LLM provider the candidate has available — Claude via an existing Pro/Max subscription by default, Anthropic's API or OpenAI's API as alternatives — and falls back to a deterministic rule-based path if no provider is configured, so the system runs end-to-end with no paid credentials. End-to-end correctness on a crafted regression set is 11/11, with the most interesting failures (buried scams, multi-domain matches) handled cleanly via a two-tier RAG voting rule and a body-keyword safety net.
 
 Future work: (1) extend the candidate-side RAG to retrieve the candidate's own past sent emails for tone-matching when drafting replies; (2) add a calendar-extraction tool for internship deadlines so the system emits an `.ics` invite per labeled offer; (3) explore a small fine-tuned policy for the per-thread Gmail UI actions à la BrowserAgent [9], to reduce reliance on hand-coded selectors; (4) calibrate the scam scorer against Fraud-R1's `fake_job` slice [5] for a quantitative recall number.
 
