@@ -131,8 +131,23 @@ async def _wait_for_login_and_detect_email() -> str | None:
 
 
 def _launch_dashboard() -> str | None:
-    """Start Streamlit detached, watch its log for the URL, return it."""
+    """Start Streamlit fully detached, watch its log for the URL, return it.
+
+    On Windows, when this script is run from a job object (e.g. a
+    PowerShell background task / Windows Service / VS Code task runner),
+    subprocess children inherit the job — and when the launching task
+    completes, the OS tears down everything in the job. Streamlit must
+    survive that teardown, so spawn with CREATE_BREAKAWAY_FROM_JOB +
+    CREATE_NEW_PROCESS_GROUP. The first flag lets Streamlit escape the
+    parent's job; the second isolates it from CTRL_C / CTRL_BREAK
+    signals propagated through the parent's process group."""
     log_handle = BOOT_LOG.open("w", encoding="utf-8")
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        )
     subprocess.Popen(
         [
             str(VENV_PY), "-m", "streamlit", "run", "streamlit_app.py",
@@ -143,6 +158,7 @@ def _launch_dashboard() -> str | None:
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
+        creationflags=creationflags,
     )
     deadline = time.time() + 30
     while time.time() < deadline:
