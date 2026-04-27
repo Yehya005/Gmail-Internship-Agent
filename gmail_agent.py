@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ import apply_labels
 import classifier
 import read_emails
 from cv_match import get_matcher
+from llm import _claude_cli_path
 
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
@@ -270,6 +272,136 @@ def _append_history(emails: list[dict], thread_labels: dict[str, list[str]]) -> 
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+# ── Claude-as-orchestrator cycle ────────────────────────────────────────────
+#
+# Per cycle, we hand control to Claude (via `claude -p`) which:
+#   1. Calls the read script (read_emails.py CLI) to scrape fresh emails.
+#   2. Reads the resulting emails.json + plan.txt and decides labels per email.
+#   3. Calls the apply script (apply_labels.py CLI) to apply those labels.
+#
+# Python (this module) still owns the cycle loop, the history append, and the
+# cold-start (Chrome + login + label setup) — Claude is the brain, not the
+# scheduler. Each cycle is one `claude -p` invocation; that's the entire
+# "decision" surface.
+
+PROJECT = Path(__file__).parent
+_CYCLE_PROMPT_TEMPLATE = """\
+You are the cycle worker for a Gmail Internship Monitor. Run ONE cycle now.
+
+Working directory: {project}
+
+Tools available: Bash (with venv\\Scripts\\python on PATH), Read, Write.
+
+Step 1 — scan inbox via the read script:
+  Run via Bash: `venv\\Scripts\\python read_emails.py --interval {interval} --out emails.json`
+  Then Read emails.json.
+
+  If emails.json contains an empty list `[]`, output exactly `0 read, 0 labeled, 0 pairs` and stop. Do NOT run apply_labels.py.
+
+Step 2 — classify each email using your judgement:
+  Read plan.txt — that's the candidate's CV. Use it as grounding for label decisions.
+
+  Allowed labels (use ONLY these, case-sensitive):
+    "AI/ML", "Research", "Software Engineering", "Embedded Systems", "DevOps", "Scam Risk"
+
+  Rules:
+    - "Scam Risk" is exclusive — if you apply it, do NOT add topic labels to the same email. Apply when the email asks for upfront fees, deposits, dollar amounts tied to deposits/fees, or skips standard hiring steps (no interview, fast-track, instant offer).
+    - For real internship emails, return EVERY topic from the allowed list whose subject matter is meaningfully present in the email AND is supported by the CV. Multi-label is fine when the email genuinely spans several topics.
+    - Off-topic emails (marketing pitches, unrelated domain, generic newsletters) → empty list `[]`.
+
+Step 3 — apply via the add-label script:
+  Build the label map: for every email that got at least one label, map its `thread_id` (exact value from emails.json) to its label list.
+  Write to to_label.json with this exact shape:
+      {{"thread_labels": {{"<thread_id_1>": ["AI/ML"], "<thread_id_2>": ["Scam Risk"]}}}}
+  Skip emails with empty label lists — don't add them to the map.
+
+  Run via Bash: `venv\\Scripts\\python apply_labels.py --in to_label.json`
+
+Final output: print exactly one line:
+  `<N> read, <M> labeled, <K> pairs`
+  where N = total emails in emails.json, M = number of emails with at least one label, K = sum of labels across all labeled emails.
+"""
+
+
+def _run_claude_cycle(cycle_minutes: float) -> tuple[int, int]:
+    """One LLM-orchestrated cycle. Claude invokes read_emails.py, decides
+    labels using its own judgement grounded in plan.txt, invokes
+    apply_labels.py. Returns (n_read, n_labeled). Python (this caller)
+    appends per-account history afterward by reading the JSON files
+    Claude wrote."""
+    cli = _claude_cli_path()
+    if not cli:
+        print("  [claude] CLI not found — cycle skipped.")
+        return 0, 0
+
+    prompt = _CYCLE_PROMPT_TEMPLATE.format(
+        project=str(PROJECT).replace("\\", "/"),
+        interval=cycle_minutes,
+    )
+
+    # Clean stale to_label.json so we never apply the previous cycle's
+    # decisions if Claude bails out before writing a new one.
+    label_path = PROJECT / "to_label.json"
+    label_path.unlink(missing_ok=True)
+
+    print("  [claude] orchestrating cycle…")
+    sys.stdout.flush()
+    try:
+        result = subprocess.run(
+            [str(cli), "-p", prompt,
+             "--output-format", "text",
+             "--dangerously-skip-permissions"],
+            capture_output=True, text=True, encoding="utf-8",
+            timeout=600,
+            cwd=str(PROJECT),
+            env={**os.environ},
+        )
+    except subprocess.TimeoutExpired:
+        print("  [claude] cycle timed out after 10 min.")
+        return 0, 0
+
+    if result.returncode != 0:
+        print(f"  [claude] cycle failed (exit {result.returncode}):")
+        print(f"    stderr: {result.stderr.strip()[:400]}")
+        return 0, 0
+
+    out = (result.stdout or "").strip()
+    summary = out.splitlines()[-1] if out else "(no output)"
+    print(f"  [claude] {summary}")
+
+    # Reconstruct the cycle outcome from the JSON files Claude wrote so
+    # we can append authoritative history (don't trust the chat summary).
+    emails_path = PROJECT / "emails.json"
+    emails: list[dict] = []
+    if emails_path.exists():
+        try:
+            data = json.loads(emails_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                emails = data
+        except Exception:
+            pass
+
+    thread_labels: dict[str, list[str]] = {}
+    if label_path.exists():
+        try:
+            payload = json.loads(label_path.read_text(encoding="utf-8"))
+            tl = payload.get("thread_labels") or {}
+            if isinstance(tl, dict):
+                thread_labels = tl
+        except Exception:
+            pass
+
+    if emails:
+        for tid, labels in thread_labels.items():
+            subject = next(
+                (e["subject"] for e in emails if e["thread_id"] == tid), tid,
+            )
+            print(f"  [LABELED {','.join(labels)}] {subject[:50]}")
+        _append_history(emails, thread_labels)
+
+    return len(emails), len(thread_labels)
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
@@ -319,40 +451,27 @@ async def main() -> None:
         print(f"  CV indexed as {len(m.chunks)} chunks.\n")
 
         # ── Monitoring loop ─────────────────────────────────────────────────
-        print(f"[4/4] Starting monitoring loop (every {args.interval:g} min).\n")
-        # Seen-set: every thread_id we've already processed. Persisted via
-        # history.jsonl so restarts don't re-handle past emails. Updated
-        # in-memory at the end of each successful cycle.
-        seen = _load_seen()
-        if seen:
-            print(f"  Loaded {len(seen)} already-processed thread(s) from {history_file.name}.\n")
+        # Cold start is done. Release the in-process Chrome connection so
+        # per-cycle CLIs (read_emails.py, apply_labels.py invoked by Claude)
+        # can connect to CDP themselves without contention. The Chrome
+        # process itself stays alive — only the Playwright client closes.
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        browser = None
+
+        print(f"[4/4] Starting monitoring loop (every {args.interval:g} min).")
+        print("  Each cycle: Claude calls read_emails.py → decides labels → calls apply_labels.py.\n")
         cycle = 1
         while True:
             print("-" * 50)
             print(f"Cycle {cycle} — {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-            # Step 1: read (skips thread_ids in `seen`)
-            emails = await _run_read(page, cycle_seconds, seen)
-
-            if not emails:
+            n_read, n_labeled = _run_claude_cycle(args.interval)
+            if n_read == 0:
                 print("  No new emails this cycle.")
             else:
-                print(f"  Read {len(emails)} email(s).")
-                # Step 2: classify (mutates each email to add scam_features + cv_match)
-                thread_labels = _run_classify(emails)
-                # Step 3: apply
-                applied, requested = await _run_apply(page, thread_labels)
-                for tid, labels in thread_labels.items():
-                    subject = next(
-                        (e["subject"] for e in emails if e["thread_id"] == tid), tid,
-                    )
-                    print(f"  [LABELED {','.join(labels)}] {subject[:50]}")
-                print(f"  Applied {applied}/{requested} (thread, label) pair(s).")
-                # Step 4: history + seen tracking
-                _append_history(emails, thread_labels)
-                for e in emails:
-                    seen.add(e["thread_id"])
-
+                print(f"  Cycle complete: {n_read} read, {n_labeled} labeled.")
             cycle += 1
             print(f"\nSleeping {args.interval:g} min until next cycle...")
             await asyncio.sleep(cycle_seconds)
