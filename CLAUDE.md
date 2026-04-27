@@ -18,7 +18,8 @@ Course project (COE548/748): an agent that monitors a Gmail inbox every few minu
 # Pipeline
 gmail_agent.py     ← orchestrator — cycle loop calls the three modules below
 read_emails.py     ← step 1: scan inbox + recency + full-body scrape (with
-                     dedup against the seen-set built from history.jsonl)
+                     dedup against the seen-set built from the active
+                     account's history_<email>.jsonl)
 classifier.py      ← step 2: scam-first → RAG → labels. Tries OpenAI first
                      when OPENAI_API_KEY is set, falls back to rule-based.
 apply_labels.py    ← step 3: per-thread three-dots → 'Label as' flow
@@ -35,13 +36,17 @@ streamlit_app.py   ← dashboard: per-email cards + sidebar Start/Stop + auto-
                      refresh + chat panel grounded in history.jsonl
 
 # Operator CLIs (all use venv\Scripts\python <name>.py)
-create_label.py    ← create one Gmail label by name (idempotent)
-switch_account.py  ← prep Chrome for signing into a different Gmail account
-reset_history.py   ← archive history.jsonl with a timestamp so the dashboard
-                     starts clean for a new account
-start_dashboard.py ← launch Streamlit AND open the URL in the default
-                     browser (no copy-paste step)
-md_to_docx.py      ← regenerate report.docx from report.md
+start_monitoring.py ← all-in-one launcher: opens Chrome → waits for login →
+                      detects the signed-in email → writes account_config.json
+                      → launches Streamlit at the matching per-account history
+account.py          ← config helper: history_path_for(email),
+                      get_active_email(), set_active_email()
+create_label.py     ← create one Gmail label by name (idempotent)
+switch_account.py   ← prep Chrome for signing into a different Gmail account
+reset_history.py    ← archive history.jsonl with a timestamp so the dashboard
+                      starts clean for a new account
+start_dashboard.py  ← launch Streamlit AND open the URL in the default browser
+md_to_docx.py       ← regenerate report.docx from report.md
 
 # Inputs / docs
 plan.txt           ← user's CV (drives both topic-keyword tables and CV-RAG)
@@ -55,12 +60,22 @@ venv/                  project-local Python virtualenv
 browsers/              Playwright's Chromium download
 emails.json            step 1 writes; step 2 consumes; dashboard inspects
 to_label.json          override file the agent reads when individual CLIs run
-history.jsonl          append-only per-cycle log; dashboard renders from this
+account_config.json    {"email": "..."} — written after login, read by agent
+                       and dashboard to pick the matching history file
+history_<email>.jsonl  per-account append-only per-cycle log (sanitized email
+                       in the filename: history_user_at_gmail.com.jsonl)
+history.jsonl          legacy fallback used only when no account is set
 history_*.jsonl.bak    archives produced by reset_history.py
 agent.pid              PID of the agent spawned by the dashboard's Start
 agent_output.log       agent stdout/stderr
 streamlit_boot.log     Streamlit's boot log; start_dashboard.py reads URL
 ```
+
+**Per-account history.** `account.get_active_history_path()` is called at
+runtime by both `gmail_agent.py` (for the seen-set + appending records) and
+`streamlit_app.py` (for rendering cards). Both pick up whichever account
+`account_config.json` currently points at, so signing into a previously-
+monitored Gmail picks up its prior records instead of starting empty.
 
 The number of labels and the number of CV chunks are both **variable** — they fall out of the `LABELS` constant and the contents of `plan.txt`. There's nothing in the code that hard-codes "5" or "6" or "13".
 
@@ -133,11 +148,13 @@ set OPENAI_API_KEY=[INSERT API KEY HERE]
 ## Running
 
 ```bash
-# A) Dashboard (recommended) — Start/Stop in the sidebar, auto-opens in browser
-venv\Scripts\python start_dashboard.py
+# A) Recommended — opens Chrome, waits for login, detects the email,
+#    then opens the dashboard pointed at THAT account's history file.
+venv\Scripts\python start_monitoring.py
 
-# B) Dashboard manually (no auto-open)
-venv\Scripts\python -m streamlit run streamlit_app.py
+# B) Dashboard alone (Chrome already open, account_config.json already set)
+venv\Scripts\python start_dashboard.py
+venv\Scripts\python -m streamlit run streamlit_app.py     # no auto-open
 
 # C) Standalone agent (no dashboard)
 venv\Scripts\python -u gmail_agent.py
@@ -159,15 +176,21 @@ venv\Scripts\python md_to_docx.py                 # regenerate report.docx
 
 ### Switching to a different Gmail account
 
-Run, in this order:
+Run:
 
 ```bash
-venv\Scripts\python switch_account.py
-venv\Scripts\python reset_history.py
-venv\Scripts\python start_dashboard.py
+venv\Scripts\python start_monitoring.py
 ```
 
-Then sign into the new account in the Chrome window that just popped up, and click **Start agent** in the dashboard browser tab that just opened.
+Sign into whichever account you want to monitor in the Chrome window that
+opens. After login is detected, `start_monitoring.py` writes the email to
+`account_config.json`, picks the matching `history_<email>.jsonl` (creating
+it if it's a first-time account, reusing it if you've monitored this account
+before), and launches the dashboard pointed at that file. Click **Start agent**
+in the dashboard sidebar.
+
+There's no `reset_history.py` step in this flow — the dashboard never mixes
+two accounts' records because each account has its own history file.
 
 ## Current Status (session 2026-04-26)
 

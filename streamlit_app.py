@@ -22,8 +22,9 @@ from pathlib import Path
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+import account
+
 PROJECT = Path(__file__).parent
-HISTORY = PROJECT / "history.jsonl"
 PID_FILE = PROJECT / "agent.pid"
 AGENT_LOG = PROJECT / "agent_output.log"
 # Use the venv python so the spawned agent has playwright + sentence-transformers.
@@ -42,10 +43,14 @@ LABEL_COLORS = {
 
 
 def load_records() -> list[dict]:
-    if not HISTORY.exists():
+    """Read the active account's per-cycle history. Resolved at call
+    time so flipping `account_config.json` updates the view on the next
+    refresh without restarting Streamlit."""
+    history = account.get_active_history_path()
+    if not history.exists():
         return []
     out: list[dict] = []
-    for line in HISTORY.read_text(encoding="utf-8").splitlines():
+    for line in history.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -228,7 +233,17 @@ st.set_page_config(
     page_icon="📥",
 )
 st.title("Gmail Internship Monitor")
-st.caption("Live view of every email the agent has scanned, classified, and labeled.")
+_active_email = account.get_active_email()
+_active_history = account.get_active_history_path()
+if _active_email:
+    st.caption(
+        f"Monitoring **{_active_email}**  ·  history: `{_active_history.name}`"
+    )
+else:
+    st.caption(
+        "No active account detected — run `start_monitoring.py` to sign in. "
+        "Showing legacy `history.jsonl` if present."
+    )
 
 # Sidebar — agent process control + auto-refresh settings.
 with st.sidebar:
@@ -314,8 +329,9 @@ st.divider()
 
 if not records:
     st.info(
-        "No history yet. Start the agent (`venv\\Scripts\\python -u gmail_agent.py`) "
-        "and a record will appear here after each cycle."
+        "No history yet for this account. Click **Start agent** in the sidebar "
+        "(or run `venv\\Scripts\\python -u gmail_agent.py`) and a record will "
+        "appear here after each cycle."
     )
 else:
     for r in records[:50]:

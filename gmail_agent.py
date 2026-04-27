@@ -34,6 +34,7 @@ from playwright.async_api import (
     Browser, BrowserContext, Page, Playwright, async_playwright,
 )
 
+import account
 import apply_labels
 import classifier
 import read_emails
@@ -54,7 +55,6 @@ LABELS = [
 
 CDP_PORT = 9222
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-HISTORY_FILE = Path("history.jsonl")
 
 
 # ── Browser bootstrap ───────────────────────────────────────────────────────
@@ -221,12 +221,13 @@ async def _run_read(
 
 
 def _load_seen() -> set[str]:
-    """Populate the seen-set from history.jsonl so a restart doesn't
-    re-process emails the agent has already handled in a prior session."""
+    """Populate the seen-set from the active account's history file so a
+    restart doesn't re-process emails handled in a prior session."""
     seen: set[str] = set()
-    if not HISTORY_FILE.exists():
+    history_file = account.get_active_history_path()
+    if not history_file.exists():
         return seen
-    for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+    for line in history_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -260,7 +261,8 @@ async def _run_apply(
 
 def _append_history(emails: list[dict], thread_labels: dict[str, list[str]]) -> None:
     cycle_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+    history_file = account.get_active_history_path()
+    with history_file.open("a", encoding="utf-8") as f:
         for e in emails:
             record = dict(e)
             record["labels_applied"] = thread_labels.get(e["thread_id"], [])
@@ -286,7 +288,11 @@ async def main() -> None:
     cycle_seconds = int(args.interval * 60)
 
     print("=== Gmail Internship Monitor ===")
-    print(f"Cycle: {args.interval:g} min\n")
+    print(f"Cycle: {args.interval:g} min")
+    active_email = account.get_active_email()
+    history_file = account.get_active_history_path()
+    print(f"Account: {active_email or '(not set — using legacy history.jsonl)'}")
+    print(f"History: {history_file.name}\n")
 
     pw = await async_playwright().start()
     browser: Browser | None = None
@@ -319,7 +325,7 @@ async def main() -> None:
         # in-memory at the end of each successful cycle.
         seen = _load_seen()
         if seen:
-            print(f"  Loaded {len(seen)} already-processed thread(s) from history.jsonl.\n")
+            print(f"  Loaded {len(seen)} already-processed thread(s) from {history_file.name}.\n")
         cycle = 1
         while True:
             print("-" * 50)
