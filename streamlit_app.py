@@ -241,8 +241,9 @@ _active_email = account.get_active_email()
 _active_history = account.get_active_history_path()
 _provider = llm._provider()
 _provider_label = {
-    "anthropic": "🧠 Claude (Anthropic)",
-    "openai":    "🧠 GPT (OpenAI)",
+    "claude_cli": "🧠 Claude (Pro subscription)",
+    "anthropic":  "🧠 Claude (Anthropic API)",
+    "openai":     "🧠 GPT (OpenAI)",
 }.get(_provider, "⚙️ Rule-based fallback")
 if _active_email:
     st.caption(

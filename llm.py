@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -40,10 +43,41 @@ _CV_PATH = _PROJECT / "plan.txt"
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+# Known winget install path — used when `claude` isn't on PATH. winget
+# installs Claude Code here on Windows but only updates PATH for new
+# shells, so a child Python process spawned before logout may not see
+# `claude` directly. Falling back to the absolute path keeps the LLM
+# call working without a logout / reboot.
+_CLAUDE_CLI_FALLBACK = Path(
+    os.environ.get("LOCALAPPDATA", ""),
+    "Microsoft", "WinGet", "Packages",
+    "Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe",
+    "claude.exe",
+)
+
+
+def _claude_cli_path() -> str | None:
+    """Resolve the `claude` binary. Prefer PATH; fall back to the winget
+    location if PATH hasn't been refreshed since install."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    if _CLAUDE_CLI_FALLBACK.exists():
+        return str(_CLAUDE_CLI_FALLBACK)
+    return None
+
 
 def _provider() -> str | None:
-    """Return 'anthropic', 'openai', or None depending on which key is set.
-    Anthropic wins if both are set — that's the project's preferred LLM."""
+    """Return one of:
+       - 'claude_cli' — preferred, uses the user's Claude Pro/Max
+         subscription via the local CLI (no API-key billing).
+       - 'anthropic'  — direct API call with ANTHROPIC_API_KEY.
+       - 'openai'     — fallback to OPENAI_API_KEY.
+       - None         — rule-based path will run.
+    Resolved in priority order so a Pro user with a token gets the
+    free-with-subscription path automatically."""
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and _claude_cli_path():
+        return "claude_cli"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
     if os.environ.get("OPENAI_API_KEY"):
@@ -108,6 +142,73 @@ def _user_prompt(
         f"Sender: {email.get('sender', '')}\n"
         f"Body:\n{email.get('body', '')}\n"
     )
+
+
+def _decide_via_claude_cli(
+    email: dict, scam_features: dict, cv_match: dict,
+    allowed_labels: list[str], cv_text: str,
+) -> list[str]:
+    """Shell out to `claude -p` and parse a strict-JSON response.
+
+    The standalone Claude Code CLI authenticates with the user's Pro/Max
+    subscription via CLAUDE_CODE_OAUTH_TOKEN, so this path costs zero
+    API credit. Trade-off vs. the SDK paths: Claude CLI doesn't expose
+    response_format / forced tool-use, so we lean on a strict-JSON
+    instruction in the prompt and post-validate against `allowed_labels`.
+    Markdown-fenced output is tolerated — common with reasoning models."""
+    cli = _claude_cli_path()
+    if not cli:
+        raise RuntimeError("claude CLI not found on PATH")
+
+    # Combine system + user into one prompt — `claude -p <prompt>` is
+    # one-shot; there's no separate system slot in --print mode.
+    prompt = (
+        f"{_system_prompt()}\n\n"
+        f"{_user_prompt(email, scam_features, cv_match, allowed_labels, cv_text)}\n"
+        f"\n---- OUTPUT ----\n"
+        f"Reply with STRICT JSON ONLY — no prose, no markdown fences.\n"
+        f"Schema: {{\"labels\": [\"...\"]}}.\n"
+        f"`labels` may only contain values from {allowed_labels}.\n"
+        f"Empty list [] if no labels apply."
+    )
+
+    # Pass the prompt on stdin to avoid Windows command-line length
+    # limits and quoting issues. --output-format text yields the raw
+    # model response (no SDK wrapper JSON).
+    result = subprocess.run(
+        [cli, "-p", "--output-format", "text"],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        # The token is already in the parent env, but be explicit so
+        # the call works even when invoked from a service that strips
+        # parent env (e.g. some Streamlit deployments).
+        env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN":
+             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude -p exited {result.returncode}: {result.stderr.strip()[:300]}"
+        )
+
+    raw = result.stdout.strip()
+    # Strip ```json fences if the model added them despite instructions.
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL)
+        raw = raw.strip()
+    # If there's still surrounding prose, isolate the first JSON object.
+    if not raw.startswith("{"):
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+
+    parsed = json.loads(raw)
+    labels = parsed.get("labels") or []
+    if not isinstance(labels, list):
+        raise ValueError(f"claude returned non-list labels: {labels!r}")
+    return labels
 
 
 def _decide_via_anthropic(
@@ -214,7 +315,11 @@ def decide_labels(
     cv_text = _CV_PATH.read_text(encoding="utf-8") if _CV_PATH.exists() else ""
 
     provider = _provider()
-    if provider == "anthropic":
+    if provider == "claude_cli":
+        labels = _decide_via_claude_cli(
+            email, scam_features, cv_match, allowed_labels, cv_text,
+        )
+    elif provider == "anthropic":
         labels = _decide_via_anthropic(
             email, scam_features, cv_match, allowed_labels, cv_text,
         )
@@ -224,7 +329,8 @@ def decide_labels(
         )
     else:
         raise RuntimeError(
-            "no LLM key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
+            "no LLM provider available — set CLAUDE_CODE_OAUTH_TOKEN, "
+            "ANTHROPIC_API_KEY, or OPENAI_API_KEY"
         )
 
     # Defensive: dedupe + drop anything outside allowed (the schema/tool
@@ -243,7 +349,8 @@ def decide_labels(
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     if not llm_available():
-        print("no LLM key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY).")
+        print("no LLM provider available — set CLAUDE_CODE_OAUTH_TOKEN, "
+              "ANTHROPIC_API_KEY, or OPENAI_API_KEY.")
         sys.exit(1)
     print(f"using provider: {_provider()}")
     sample_email = {
