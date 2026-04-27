@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Course project (COE548/748): an agent that monitors a Gmail inbox every few minutes, scrapes each fresh email's full body, scores it for scam risk, retrieves matching evidence from the user's CV (RAG), and applies one or more labels.
 
-`gmail_agent.py` is now a thin **orchestrator**. Each cycle calls three single-purpose modules in order: `read_emails.read()` → `classifier.classify_emails()` → `apply_labels.apply()`. Each module is also runnable as a CLI (`python read_emails.py`, etc.) for debugging. No IPC wait, no external decider — the rule-based classifier is in-process and synchronous. If a step raises, the agent logs the error, runs whatever partial work succeeded, and continues to the next cycle.
+`gmail_agent.py` is now a thin **orchestrator**. Each cycle calls three single-purpose modules in order: `read_emails.read()` → `classifier.classify_emails()` → `apply_labels.apply()`. Each module is also runnable as a CLI (`python read_emails.py`, etc.) for debugging. The classifier's primary path is an LLM call — preferring Claude (Pro/Max subscription via the standalone `claude` CLI) when `CLAUDE_CODE_OAUTH_TOKEN` is set, falling back to direct API (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`), then to a deterministic rule-based path on any failure. If a step raises, the agent logs the error, runs whatever partial work succeeded, and continues to the next cycle.
 
 **Labels** are an *editable list* in `gmail_agent.py` — `LABELS = [...]`. Add or remove categories there; the agent creates each missing one in Gmail at startup (idempotent). Today's default set covers the user's CV: `AI/ML`, `Research`, `Software Engineering`, `Embedded Systems`, `DevOps`, `Scam Risk`. `Scam Risk` is **exclusive** — when applied, no topic labels go on the same email.
 
@@ -20,20 +20,36 @@ gmail_agent.py     ← orchestrator — cycle loop calls the three modules below
 read_emails.py     ← step 1: scan inbox + recency + full-body scrape (with
                      dedup against the seen-set built from the active
                      account's history_<email>.jsonl)
-classifier.py      ← step 2: scam-first → RAG → labels. Tries OpenAI first
-                     when OPENAI_API_KEY is set, falls back to rule-based.
+classifier.py      ← step 2: scam-first → RAG → labels. LLM path is primary
+                     (claude_cli / anthropic / openai); deterministic
+                     rule-based path is the fallback. Word-boundary keyword
+                     matching (`kw_match` from cv_match) so 'ai' matches
+                     "in ai." but not "email", and 'ml' stops matching "html".
 apply_labels.py    ← step 3: per-thread three-dots → 'Label as' flow
 
 # Decision-side helpers
 scam_scorer.py     ← deterministic scam-risk heuristic (no LLM)
 cv_match.py        ← RAG matcher: embeds CV chunks (each tagged with topics +
-                     'project'/'generic' kind), cosine retrieval
-llm.py             ← optional OpenAI structured-JSON call used by classifier.
-                     Reads OPENAI_API_KEY from env; never hard-codes the key.
+                     'project'/'generic' kind), cosine retrieval. Exposes
+                     kw_match() — a `\b{kw}\b` word-boundary helper used by
+                     classifier.py for body-keyword scoring.
+llm.py             ← LLM-backed label decider. Provider preference:
+                       1. claude_cli — standalone `claude -p` CLI billing
+                          via the user's Pro/Max subscription
+                          (CLAUDE_CODE_OAUTH_TOKEN). No API-key needed.
+                       2. anthropic  — direct API with ANTHROPIC_API_KEY,
+                          enum-constrained via forced tool_use call.
+                       3. openai    — direct API with OPENAI_API_KEY,
+                          enum-constrained via response_format=json_schema.
+                     Same RAG-grounded prompt across all three (full CV +
+                     top-k retrieved chunks + scam features + email).
 
 # UI
 streamlit_app.py   ← dashboard: per-email cards + sidebar Start/Stop + auto-
-                     refresh + chat panel grounded in history.jsonl
+                     refresh + chat panel grounded in history.jsonl. Header
+                     caption shows which classifier is live: 🧠 Claude (Pro
+                     subscription) / 🧠 Claude (Anthropic API) / 🧠 GPT
+                     (OpenAI) / ⚙️ Rule-based fallback.
 
 # Operator CLIs (all use venv\Scripts\python <name>.py)
 start_monitoring.py ← all-in-one launcher: opens Chrome → waits for login →
@@ -95,10 +111,12 @@ The number of labels and the number of CV chunks are both **variable** — they 
 7. **Step 2 — `classifier.classify_emails(emails)`.** Pure-Python decision, no Chrome. Per email:
    - `scam_scorer.score_email_dict(...)` → if score ≥ 0.5, label is `["Scam Risk"]` only and we stop (Scam Risk is exclusive).
    - Else `cv_match.match(body)` returns the top-5 retrieved CV chunks each with `{similarity, topics, kind}`. If max similarity < 0.30 the email is off-topic for this CV → no labels. Generic CV sections (Skills, Interests, …) carry no topics by design — they only contribute to the similarity score.
-   - **Two-tier RAG voting** over project chunks at sim ≥ 0.30:
+   - **LLM path (primary).** When any provider is available (`llm.llm_available()` checks `CLAUDE_CODE_OAUTH_TOKEN` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY`), call `llm.decide_labels(email, scam_features, cv_match, allowed_labels)`. The model sees the full email + scam features + retrieved CV chunks (RAG context) + the candidate's CV + the allowed-labels enum, and returns the label list. Anthropic API constrains output via a forced tool-use input_schema enum; OpenAI via `response_format=json_schema`; the Claude CLI relies on a strict-JSON instruction + post-validation. On any LLM failure (parse error, rate-limit, network), fall through to the rule-based path.
+   - **Rule-based fallback** — same retrieved chunks, no LLM:
+     - **Two-tier RAG voting** over project chunks at sim ≥ 0.30:
        - **High-confidence** (sim ≥ 0.50): emit each of the chunk's topics directly. Multiple high-scoring chunks for different topics will multi-label even on terse bodies.
        - **Moderate** (0.30 ≤ sim < 0.50): emit a topic only if the email body literally contains one of that topic's keywords. Stops a moderately-similar project (e.g. CPU Simulator at 0.34) from dragging Software Engineering onto every tech email.
-   - **Body-keyword safety net.** For any topic not yet emitted, add it if the body literally mentions one of its keywords. Catches two cases: (a) topics not covered by any project chunk (DevOps in this CV); (b) topics whose project chunk ranked just below threshold even though the email mentions them (e.g. a 'research using deep learning' email where ECG dominates retrieval and EEG sits at sim 0.26). Off-topic pitches are still blocked by the cv_match threshold gate above, so this won't fire on marketing-style content.
+     - **Body-keyword safety net.** For any topic not yet emitted, add it if the body literally mentions one of its keywords (using `kw_match` — a `\b{kw}\b` word-boundary regex so 'ai' matches "in ai." but not "email", and 'ml' stops matching "html"). Catches two cases: (a) topics not covered by any project chunk (DevOps in this CV); (b) topics whose project chunk ranked just below threshold even though the email mentions them. Off-topic pitches are still blocked by the cv_match threshold gate above, so this won't fire on marketing-style content.
    - Each email's dict is mutated in place to attach the `scam_features` and `cv_match` blocks (used by `history.jsonl` + the dashboard).
 8. **Step 3 — `apply_labels.apply(page, thread_labels)`.** For each `(thread, label)` pair, in isolation:
    - Tick the row's checkbox via JS on `.oZ-jc` / `[role="checkbox"]`.
@@ -140,9 +158,22 @@ venv\Scripts\python -m pip install -r requirements.txt
 set PLAYWRIGHT_BROWSERS_PATH=c:\Users\Yehya\Downloads\LLMIntern\browsers
 venv\Scripts\python -m playwright install chromium
 
-# Optional — enable the LLM-backed classifier path. Without this var
-# the rule-based path runs and the system still works end-to-end.
-set OPENAI_API_KEY=[INSERT API KEY HERE]
+# Pick ONE of these to activate the LLM classifier path. Without any
+# of them, the rule-based path runs and the system still works end-to-end.
+
+# Recommended — uses your Claude Pro/Max subscription, no API-key billing.
+# 1) Install the standalone Claude Code CLI:
+winget install Anthropic.ClaudeCode
+# 2) Generate a long-lived OAuth token (browser opens once):
+claude setup-token
+# 3) Persist it for future shells:
+setx CLAUDE_CODE_OAUTH_TOKEN "sk-ant-oat01-..."
+
+# Alternative — direct Anthropic API (separate billing):
+set ANTHROPIC_API_KEY=sk-ant-...
+
+# Alternative — OpenAI API:
+set OPENAI_API_KEY=sk-...
 ```
 
 ## Running
@@ -192,7 +223,7 @@ in the dashboard sidebar.
 There's no `reset_history.py` step in this flow — the dashboard never mixes
 two accounts' records because each account has its own history file.
 
-## Current Status (session 2026-04-26)
+## Current Status (session 2026-04-27)
 
 ### What works end-to-end
 - Real-Chrome connect via CDP; manual login detection.
@@ -200,12 +231,13 @@ two accounts' records because each account has its own history file.
 - Per-row inbox scan with timestamp parsing + recency filter + 60-s safe zone.
 - Full-body scrape per fresh email (subject-cell click via real-MouseEvent dispatch).
 - `scam_scorer.py` — heuristic features (sender domain, payment-phrase lexicon incl. `$N fee/charge` regex, no-interview / fast-track signals, generic greetings, suspicious URLs, urgency, hyperbolic comp, all-caps subject), each with a human-readable reason.
-- `cv_match.py` — RAG over CV chunks (sentence-transformers, cosine retrieval, top-k retrieved evidence + missing skills).
-- `classifier.py` — autonomous decision step. Tries the LLM path first when `OPENAI_API_KEY` is set; falls back to the deterministic rule-based path on any error (missing key, network failure, parse mismatch, …) so the system always works.
-- `llm.py` — single-shot OpenAI call with structured-JSON output. Builds a prompt from the email + scam features + retrieved CV chunks (RAG context) + allowed labels, returns the parsed label list.
+- `cv_match.py` — RAG over CV chunks (sentence-transformers, cosine retrieval, top-k retrieved evidence + missing skills). Word-boundary keyword helper `kw_match()` shared with classifier.py.
+- `classifier.py` — LLM-first decision step. `llm.decide_labels()` is called whenever any provider key is set; deterministic rule-based path is the fallback.
+- `llm.py` — three providers, picked by env: claude_cli (Pro subscription via standalone CLI) → anthropic (API key, forced tool-use enum) → openai (API key, response_format=json_schema). Same RAG-grounded prompt across all three.
 - Per-thread label apply via three-dots → "Label as" → menuitemcheckbox.
-- `history.jsonl` per-cycle log.
-- Streamlit dashboard with auto-refresh + sidebar Start/Stop + free-text filter.
+- Per-account `history_<email>.jsonl` log (legacy `history.jsonl` is the no-account fallback).
+- `start_monitoring.py` all-in-one launcher: opens Chrome → waits for login → detects email → opens dashboard at the matching per-account history. Login-gated: exits cleanly on timeout, never opens the UI without an account. Dashboard subprocess spawned with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP` so it survives the launcher's exit on Windows.
+- Streamlit dashboard with auto-refresh + sidebar Start/Stop + free-text filter + chat panel + provider-aware caption (🧠 Claude Pro / Anthropic / OpenAI / ⚙️ Rules).
 
 ### Known thread IDs for test internship emails
 ```json
@@ -218,9 +250,9 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 
 ## Rubric status
 
-- ✅ **Custom LLM Agent.** `llm.py` calls OpenAI with structured-JSON output and the RAG-retrieved CV chunks as grounding. `classifier.py` routes through it when `OPENAI_API_KEY` is set; falls back to rule-based on any error.
+- ✅ **Custom LLM Agent.** `llm.py` calls Claude (subscription via standalone CLI by default; Anthropic / OpenAI APIs as alternatives) with the RAG-retrieved CV chunks as grounding and an enum-constrained label output. `classifier.py` routes through it whenever any provider key is set; falls back to rule-based on any error.
 - ✅ **RAG with vector embeddings.** `cv_match.py` — sentence-transformers `all-MiniLM-L6-v2`, cosine retrieval, project chunks tagged with topics.
-- ✅ **3+ tools, ≥1 custom.** Gmail browser-automation (custom), `scam_scorer` (custom), `cv_match` RAG (uses HF Hub model), OpenAI API call from `llm.py` (external API).
+- ✅ **3+ tools, ≥1 custom.** Gmail browser-automation (custom), `scam_scorer` (custom), `cv_match` RAG (uses HF Hub model), Claude / OpenAI API call from `llm.py` (external API).
 - ✅ **UI.** Streamlit dashboard with per-email cards, auto-refresh, sidebar Start/Stop, and a chat panel grounded in `history.jsonl`.
 - ✅ **Conversation history + error handling.** Chat panel persists via `st.session_state`; cycle persistence in `history.jsonl`; try/except wrappers around each pipeline step.
 - ✅ **README.txt** — full first-time-user walkthrough.
@@ -229,12 +261,16 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 
 ## Recent additions
 
-- `llm.py` + `classifier.py` LLM-first path with rule-based fallback.
+- `llm.py` rewrite: three-provider routing (claude_cli / anthropic / openai). Default path uses the user's Claude Pro/Max subscription via the standalone `claude -p` CLI — no API-key billing.
+- `classifier.py` LLM-first path with rule-based fallback.
+- Word-boundary keyword matching (`kw_match` in cv_match.py): 'ai' matches "in ai." but not "email"; 'ml' stops matching "html". Shared between `_raw_chunk_topics` (chunk topic-tagging) and the classifier's body-keyword safety net.
 - Chat panel in the dashboard with intent recognition (`why`, `scam`, `best`, label-name) over `history.jsonl`.
 - Two-tier RAG voting: high-sim project chunks emit topics directly; moderate matches need body-keyword confirmation; body-keyword safety net for missed labels.
 - `seen` set loaded from `history.jsonl` so cycle dedup survives restarts.
+- `account.py` + per-account `history_<email>.jsonl` files — switching back to a previously-monitored Gmail picks up its prior records instead of starting empty.
+- `start_monitoring.py` all-in-one launcher: opens Chrome → waits for login → detects the signed-in email → writes `account_config.json` → launches Streamlit at the matching per-account history. Login-gated, no orphan UI on timeout.
+- Dashboard provider-aware caption (🧠 Claude Pro / Anthropic / OpenAI / ⚙️ Rules) so the demo viewer can see which classifier is live.
 - Operator CLIs: `create_label.py`, `switch_account.py`, `reset_history.py`, `start_dashboard.py`, `md_to_docx.py`.
-- Multi-account support via `switch_account.py` + `reset_history.py` + `start_dashboard.py` sequence.
 
 ## Key Lessons (all saved in memory/)
 
@@ -250,6 +286,9 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 10. **Full bodies via `div.a3s.aiL`** — row snippets are ~100 chars and let scammers bury the payload.
 11. **Two-tier classifier voting:** strong RAG signals (sim ≥ 0.50) are trusted directly so multi-label cases work on terse bodies; moderate matches (0.30–0.50) require a body-keyword confirmation; topics not yet emitted get a body-keyword safety net so EEG-Research-style misses on terse-CV chunks aren't dropped.
 12. **All files inside the project directory** — venv in `venv/`, browsers in `browsers/`.
+13. **Word-boundary keyword matching** (`\b{kw}\b`): bare 'ai' or 'ml' would otherwise either miss "in ai." or fire on "email" / "html". Use `kw_match()` from cv_match.py everywhere keywords are tested against text.
+14. **Login → UI, never UI on login failure.** `start_monitoring.py` exits cleanly when login times out. Falling back to a legacy-history dashboard left an orphan tab pointed at the wrong account, and a re-run sat waiting for login behind that orphan.
+15. **Windows job teardown breaks subprocess chains.** When `start_monitoring.py` is invoked from a PowerShell background task / VS Code task runner, every subprocess.Popen child joins the parent's Windows Job by default — and when the parent task ends, the OS tears down the entire Job. Streamlit + the agent it just spawned both die mid-import with `KeyboardInterrupt`. Spawn the dashboard with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP` so it escapes the parent's Job. The agent inherits Streamlit's no-Job status from there.
 
 ## Course Evaluation Weights
 
