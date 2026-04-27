@@ -12,7 +12,12 @@ agent_output.log
 
 # Per-cycle history fed into the Streamlit dashboard (real email content)
 history.jsonl
+history_*.jsonl
 history_*.jsonl.bak
+
+# Active-account config — written after the user signs in. Contains the
+# user's Gmail address; never push.
+account_config.json
 
 # Agent process tracking — written by the dashboard's Start/Stop buttons
 agent.pid
@@ -27,6 +32,7 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+~$*.docx
 
 # Claude Code project state (user-local)
 .claude/
