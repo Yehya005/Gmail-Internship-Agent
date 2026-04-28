@@ -399,14 +399,21 @@ else:
 
 
 # ── Chat panel ───────────────────────────────────────────────────────────────
-# A grounded Q&A box at the bottom of the dashboard. Every answer is derived
-# from records the agent actually wrote to history.jsonl — no LLM call. The
-# conversation persists across reruns within the browser session via
-# st.session_state, which also satisfies the rubric's conversation-history
-# requirement.
+# A grounded Q&A box at the bottom of the dashboard. When an LLM provider is
+# configured, free-form questions go to the LLM (`llm.chat_about_history`)
+# with the agent's history records inlined as evidence. Without a provider,
+# falls back to the rule-based `search_history` summary. Either way the
+# conversation persists across reruns via st.session_state.
 
 st.divider()
 st.subheader("Ask the agent")
+_chat_caption = (
+    "Routed through {p}. Ground every answer in the records below."
+    if _provider else
+    "Rule-based fallback (no LLM provider configured) — answers come from a "
+    "scripted summary of `history.jsonl`."
+)
+st.caption(_chat_caption.format(p=_provider_label) if _provider else _chat_caption)
 st.caption(
     "Try: *why was the latest scam labeled?* · *show me AI/ML emails* · "
     "*best CV match* · *anything from Mazloum?*"
@@ -442,8 +449,23 @@ with cols[1]:
 
 if query := st.chat_input("Ask about the labeled emails…"):
     st.session_state.chat_history.append({"role": "user", "content": query})
+    # Pre-filter records via the existing rule-based intent recognizer so
+    # the LLM (and the cards under the answer) get a focused subset rather
+    # than the full history every time. Cap at 30 records to keep prompts
+    # bounded.
     summary, results = search_history(query, records)
+    candidates = results if results else records[:30]
+    if llm.llm_available():
+        try:
+            answer = llm.chat_about_history(query, candidates[:30])
+        except Exception as e:
+            answer = (
+                f"_(LLM call failed — falling back to rule-based summary: "
+                f"`{type(e).__name__}: {str(e)[:120]}`)_\n\n{summary}"
+            )
+    else:
+        answer = summary
     st.session_state.chat_history.append({
-        "role": "assistant", "content": summary, "records": results,
+        "role": "assistant", "content": answer, "records": results,
     })
     st.rerun()

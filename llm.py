@@ -367,6 +367,151 @@ def decide_labels(
     return out
 
 
+# ── Chat (dashboard "Ask the agent" panel) ─────────────────────────────────
+
+
+_CHAT_SYSTEM = (
+    "You are the assistant for a Gmail Internship Monitor dashboard. "
+    "Answer the user's question about emails the agent has scanned, "
+    "classified, and labeled. Ground every claim in the records the user "
+    "shows you — DO NOT speculate beyond them, do not guess at emails not "
+    "in the list, and don't invent senders or labels.\n\n"
+    "When a record helped you answer, cite it inline with the email's "
+    "subject in single quotes (e.g. 'Hi'). If the records don't contain "
+    "an answer, say so plainly. Keep answers tight — usually 2-5 short "
+    "sentences. Use bullet points only when listing 3+ items.\n\n"
+    "Each record has these fields you can reference:\n"
+    "  - subject, sender, body (the email itself)\n"
+    "  - labels_applied (the labels the agent assigned)\n"
+    "  - scam_features (deterministic-scorer score + reasons — these are "
+    "    HEURISTIC HINTS the LLM saw; the LLM may have agreed or overridden)\n"
+    "  - cv_match (top-k retrieved CV chunks with similarity / kind / topics)\n"
+    "  - cycle_at (when the agent processed it)"
+)
+
+
+def _format_record_for_chat(r: dict, idx: int) -> str:
+    labels = r.get("labels_applied") or []
+    labels_str = ", ".join(labels) if labels else "(none)"
+    scam = r.get("scam_features") or {}
+    scam_score = scam.get("score") or 0
+    scam_reasons = scam.get("reasons") or []
+    cv = r.get("cv_match") or {}
+    cv_score = cv.get("score") or 0
+    matched = cv.get("matched") or []
+
+    body = (r.get("body") or "").strip()
+    if len(body) > 400:
+        body = body[:400] + "…"
+
+    parts = [
+        f"### Record {idx}",
+        f"- Subject: {r.get('subject') or '(no subject)'}",
+        f"- Sender: {r.get('sender') or '(unknown)'}",
+        f"- Cycle: {r.get('cycle_at') or '(unknown)'}",
+        f"- Labels applied: [{labels_str}]",
+        f"- Scam-scorer: score={scam_score}, "
+        f"reasons={scam_reasons[:4] if scam_reasons else '(none)'}",
+        f"- CV-match score: {cv_score}",
+    ]
+    if matched:
+        evidence_lines = []
+        for h in matched[:3]:
+            chunk = (h.get("chunk") or "").replace("\n", " ").strip()[:120]
+            evidence_lines.append(
+                f"  · sim={h.get('similarity', 0):.2f} "
+                f"kind={h.get('kind', '?')} topics={h.get('topics') or []} "
+                f"chunk=\"{chunk}…\""
+            )
+        parts.append("- Top retrieved CV evidence:\n" + "\n".join(evidence_lines))
+    parts.append(f"- Body excerpt: {body or '(empty)'}")
+    return "\n".join(parts)
+
+
+def _chat_user_prompt(question: str, records: list[dict]) -> str:
+    if not records:
+        records_block = "(no records yet — the agent hasn't logged any emails for this account)"
+    else:
+        records_block = "\n\n".join(
+            _format_record_for_chat(r, i + 1) for i, r in enumerate(records)
+        )
+    return (
+        f"User question: {question.strip()}\n\n"
+        f"---- Records the agent has logged for this account ----\n"
+        f"{records_block}\n"
+        f"---- End records ----\n\n"
+        f"Answer the question grounded in the records above."
+    )
+
+
+def _chat_via_claude_cli(question: str, records: list[dict]) -> str:
+    cli = _claude_cli_path()
+    if not cli:
+        raise RuntimeError("claude CLI not found on PATH")
+    prompt = f"{_CHAT_SYSTEM}\n\n{_chat_user_prompt(question, records)}"
+    result = subprocess.run(
+        [cli, "-p", "--output-format", "text"],
+        input=prompt,
+        capture_output=True, text=True, encoding="utf-8",
+        timeout=60,
+        env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN":
+             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude -p exited {result.returncode}: {result.stderr.strip()[:200]}"
+        )
+    return (result.stdout or "").strip()
+
+
+def _chat_via_anthropic(question: str, records: list[dict]) -> str:
+    from anthropic import Anthropic
+    client = Anthropic()
+    response = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=600,
+        system=_CHAT_SYSTEM,
+        messages=[{"role": "user",
+                   "content": _chat_user_prompt(question, records)}],
+    )
+    parts = []
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            parts.append(block.text)
+    return "\n".join(parts).strip()
+
+
+def _chat_via_openai(question: str, records: list[dict]) -> str:
+    from openai import OpenAI
+    client = OpenAI()
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": _CHAT_SYSTEM},
+            {"role": "user", "content": _chat_user_prompt(question, records)},
+        ],
+        temperature=0.2,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+def chat_about_history(question: str, records: list[dict]) -> str:
+    """Free-form Q&A over the agent's history records, routed through
+    whichever LLM provider is configured. Caller (streamlit_app.py)
+    catches and falls back to rule-based grounded search on failure."""
+    provider = _provider()
+    if provider == "claude_cli":
+        return _chat_via_claude_cli(question, records)
+    if provider == "anthropic":
+        return _chat_via_anthropic(question, records)
+    if provider == "openai":
+        return _chat_via_openai(question, records)
+    raise RuntimeError(
+        "no LLM provider available for chat — set CLAUDE_CODE_OAUTH_TOKEN, "
+        "ANTHROPIC_API_KEY, or OPENAI_API_KEY"
+    )
+
+
 # ── Self-test ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
