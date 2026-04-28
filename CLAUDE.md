@@ -20,15 +20,21 @@ gmail_agent.py     ← orchestrator — cycle loop calls the three modules below
 read_emails.py     ← step 1: scan inbox + recency + full-body scrape (with
                      dedup against the seen-set built from the active
                      account's history_<email>.jsonl)
-classifier.py      ← step 2: scam-first → RAG → labels. LLM path is primary
+classifier.py      ← step 2: heuristics-as-evidence → RAG → LLM-decided
+                     labels (including Scam Risk). LLM path is primary
                      (claude_cli / anthropic / openai); deterministic
-                     rule-based path is the fallback. Word-boundary keyword
-                     matching (`kw_match` from cv_match) so 'ai' matches
-                     "in ai." but not "email", and 'ml' stops matching "html".
+                     rule-based path with the old scam-score gate is the
+                     fallback. Word-boundary keyword matching (`kw_match`
+                     from cv_match) so 'ai' matches "in ai." but not
+                     "email", and 'ml' stops matching "html".
 apply_labels.py    ← step 3: per-thread three-dots → 'Label as' flow
 
 # Decision-side helpers
-scam_scorer.py     ← deterministic scam-risk heuristic (no LLM)
+scam_scorer.py     ← deterministic scam-risk heuristic (no LLM). When
+                     the LLM path is active these features are passed to
+                     the LLM as EVIDENCE only — the LLM is the sole scam
+                     judge. When the LLM is off the heuristic gates the
+                     decision (score >= 0.5 → ["Scam Risk"]).
 cv_match.py        ← RAG matcher: embeds CV chunks (each tagged with topics +
                      'project'/'generic' kind), cosine retrieval. Exposes
                      kw_match() — a `\b{kw}\b` word-boundary helper used by
@@ -109,10 +115,12 @@ The number of labels and the number of CV chunks are both **variable** — they 
 
 6. **Step 1 — `read_emails.read(page, cycle_seconds)`.** Navigate to `#inbox`, query `tr.zA`, extract per-row `{thread_id, subject, sender, received_ms}` (timestamp parsed from `td.xW span[title]` with fallbacks). Recency-filter: keep `received_ms ≥ now − cycle − 60 s` (the 60-s safe zone covers Gmail's minute-only timestamps). For each survivor, dispatch a real `mousedown/mouseup/click` chain on `.y6/.bog` inside a single `page.evaluate` so DOM re-renders can't detach the locator; URL flips to `#inbox/FMfcgz...`; scrape `div.a3s.aiL` for the full body; navigate back. Returns the partial set on any per-email failure so step 2 can still run on what made it through.
 7. **Step 2 — `classifier.classify_emails(emails)`.** Pure-Python decision, no Chrome. Per email:
-   - `scam_scorer.score_email_dict(...)` → if score ≥ 0.5, label is `["Scam Risk"]` only and we stop (Scam Risk is exclusive).
-   - Else `cv_match.match(body)` returns the top-5 retrieved CV chunks each with `{similarity, topics, kind}`. If max similarity < 0.30 the email is off-topic for this CV → no labels. Generic CV sections (Skills, Interests, …) carry no topics by design — they only contribute to the similarity score.
-   - **LLM path (primary).** When any provider is available (`llm.llm_available()` checks `CLAUDE_CODE_OAUTH_TOKEN` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY`), call `llm.decide_labels(email, scam_features, cv_match, allowed_labels)`. The model sees the full email + scam features + retrieved CV chunks (RAG context) + the candidate's CV + the allowed-labels enum, and returns the label list. Anthropic API constrains output via a forced tool-use input_schema enum; OpenAI via `response_format=json_schema`; the Claude CLI relies on a strict-JSON instruction + post-validation. On any LLM failure (parse error, rate-limit, network), fall through to the rule-based path.
-   - **Rule-based fallback** — same retrieved chunks, no LLM:
+   - **Heuristic features (always run, no early-exit).** `scam_scorer.score_email_dict(...)` populates `scam_features` (score + reasons + flag dict). When the LLM path is active these are EVIDENCE for the model, not a verdict. When only the rule path runs they gate the final decision.
+   - **RAG retrieval (always run).** `cv_match.match(body)` returns the top-5 retrieved CV chunks each with `{similarity, topics, kind}`. The `cv_match` block is attached to every email so the dashboard always has retrieval evidence to display, even for emails the LLM ends up flagging as Scam Risk.
+   - **LLM path (primary).** When any provider is available (`llm.llm_available()` checks `CLAUDE_CODE_OAUTH_TOKEN` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY`), call `llm.decide_labels(email, scam_features, cv_match, allowed_labels)`. The model sees the full email + scam features + retrieved CV chunks (RAG context) + the candidate's CV + the allowed-labels enum, and returns the label list. **The LLM is the sole scam judge in this path** — there's no deterministic gate in front of it, so the model can flag scams the heuristic misses (subtler social engineering) and clear false positives where the lexicon misfires. Anthropic API constrains output via a forced tool-use input_schema enum; OpenAI via `response_format=json_schema`; the Claude CLI relies on a strict-JSON instruction + post-validation. On any LLM failure (parse error, rate-limit, network), fall through to the rule-based path.
+   - **Rule-based fallback** — deterministic, no LLM:
+     - **Scam gate.** If `scam_features.score ≥ 0.5`, return `["Scam Risk"]` only (Scam Risk is exclusive).
+     - **Off-topic gate.** Else if the best CV-chunk similarity is below 0.30, return `[]`.
      - **Two-tier RAG voting** over project chunks at sim ≥ 0.30:
        - **High-confidence** (sim ≥ 0.50): emit each of the chunk's topics directly. Multiple high-scoring chunks for different topics will multi-label even on terse bodies.
        - **Moderate** (0.30 ≤ sim < 0.50): emit a topic only if the email body literally contains one of that topic's keywords. Stops a moderately-similar project (e.g. CPU Simulator at 0.34) from dragging Software Engineering onto every tech email.
@@ -232,7 +240,7 @@ two accounts' records because each account has its own history file.
 - Full-body scrape per fresh email (subject-cell click via real-MouseEvent dispatch).
 - `scam_scorer.py` — heuristic features (sender domain, payment-phrase lexicon incl. `$N fee/charge` regex, no-interview / fast-track signals, generic greetings, suspicious URLs, urgency, hyperbolic comp, all-caps subject), each with a human-readable reason.
 - `cv_match.py` — RAG over CV chunks (sentence-transformers, cosine retrieval, top-k retrieved evidence + missing skills). Word-boundary keyword helper `kw_match()` shared with classifier.py.
-- `classifier.py` — LLM-first decision step. `llm.decide_labels()` is called whenever any provider key is set; deterministic rule-based path is the fallback.
+- `classifier.py` — LLM-first decision step. `llm.decide_labels()` is called whenever any provider key is set and is the sole scam judge in that path (the deterministic 0.5 gate only kicks in when the LLM is off). Heuristic + RAG features always populate the email dict so the dashboard shows them either way.
 - `llm.py` — three providers, picked by env: claude_cli (Pro subscription via standalone CLI) → anthropic (API key, forced tool-use enum) → openai (API key, response_format=json_schema). Same RAG-grounded prompt across all three.
 - Per-thread label apply via three-dots → "Label as" → menuitemcheckbox.
 - Per-account `history_<email>.jsonl` log (legacy `history.jsonl` is the no-account fallback).
@@ -261,6 +269,8 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 
 ## Recent additions
 
+- **LLM is now the sole scam judge** when any provider is configured. `classifier.py` no longer short-circuits to `["Scam Risk"]` on `scam_score ≥ 0.5`; the heuristic features become EVIDENCE in the LLM's prompt, and the LLM decides everything (including scam). Verified end-to-end: a "pay 50 deposit, no interview, fast-track" email flagged correctly even though the deterministic scorer only gave it 0.1. The rule-based fallback keeps the original 0.5 gate so the system still works without a provider.
+- `llm.py` system prompt strengthened: explicitly states the model is the sole scam judge, treats `scam_features` as hints rather than verdicts, and lists the patterns to watch for (upfront fees, no-interview / fast-track, urgency cues, payment-to-receive-offer).
 - `llm.py` rewrite: three-provider routing (claude_cli / anthropic / openai). Default path uses the user's Claude Pro/Max subscription via the standalone `claude -p` CLI — no API-key billing.
 - `classifier.py` LLM-first path with rule-based fallback.
 - Word-boundary keyword matching (`kw_match` in cv_match.py): 'ai' matches "in ai." but not "email"; 'ml' stops matching "html". Shared between `_raw_chunk_topics` (chunk topic-tagging) and the classifier's body-keyword safety net.
@@ -289,6 +299,7 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 13. **Word-boundary keyword matching** (`\b{kw}\b`): bare 'ai' or 'ml' would otherwise either miss "in ai." or fire on "email" / "html". Use `kw_match()` from cv_match.py everywhere keywords are tested against text.
 14. **Login → UI, never UI on login failure.** `start_monitoring.py` exits cleanly when login times out. Falling back to a legacy-history dashboard left an orphan tab pointed at the wrong account, and a re-run sat waiting for login behind that orphan.
 15. **Windows job teardown breaks subprocess chains.** When `start_monitoring.py` is invoked from a PowerShell background task / VS Code task runner, every subprocess.Popen child joins the parent's Windows Job by default — and when the parent task ends, the OS tears down the entire Job. Streamlit + the agent it just spawned both die mid-import with `KeyboardInterrupt`. Spawn the dashboard with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP` so it escapes the parent's Job. The agent inherits Streamlit's no-Job status from there.
+16. **Heuristic features as LLM evidence, not as a gate.** When the LLM is in charge, don't short-circuit on the deterministic scam score — pass the heuristic flags into the prompt and let the model decide. The scorer's lexicon misses subtle social engineering (low score, real scam) and over-fires on legitimate paid internships (high score, false positive). Caveat: keep the heuristic gate in the rule-based fallback so the no-LLM path still rejects obvious scams.
 
 ## Course Evaluation Weights
 
