@@ -478,6 +478,29 @@ if (
 ):
     user_q = st.session_state.chat_history[-2]["content"]
     summary, results = search_history(user_q, records)
+
+    # Only attach record cards under the answer when the question has a
+    # clear intent to surface emails — explicit label name, "scam", "why",
+    # "show me", "best CV match", etc. For free-form questions the LLM's
+    # text answer is enough; the cards-by-default added noise (e.g. asking
+    # "what is the capital of Lebanon" was matching every email subject
+    # starting with "Hi" via substring fallback).
+    ql = user_q.lower()
+    intent_keywords = (
+        "show", "list", "which", "what email", "any email", "any mail",
+        "is there", "are there", "scam", "why", "explain", "reason",
+        "best", "highest", "top match", "strongest", "from",
+    )
+    has_listing_intent = (
+        any(lbl.lower() in ql for lbl in _ALL_LABELS)
+        or any(kw in ql for kw in intent_keywords)
+    )
+    cards_to_show = results if (has_listing_intent and results) else []
+
+    # The LLM still gets context — when results are empty (or filtered out
+    # for cards), feed it a recent slice so it can reason about "any
+    # internships from last week?" type questions even when the rule-based
+    # pre-filter didn't catch them.
     candidates = results if results else records[:30]
     if llm.llm_available():
         try:
@@ -494,6 +517,6 @@ if (
     st.session_state.chat_history[-1] = {
         "role": "assistant",
         "content": answer,
-        "records": results,
+        "records": cards_to_show,
     }
     st.rerun()
