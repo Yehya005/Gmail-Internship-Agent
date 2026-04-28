@@ -447,17 +447,41 @@ with cols[1]:
         st.session_state.chat_history = []
         st.rerun()
 
+# Two-phase chat handler so the LLM call survives Streamlit reruns.
+#
+# When the user submits a question we append BOTH the user message and a
+# pending-placeholder assistant message in a single rerun cycle, then on the
+# *next* render we detect the pending placeholder, run the LLM, and
+# overwrite the placeholder with the real answer. Splitting the work like
+# this means the autorefresh component can fire between the user submit
+# and the LLM call without losing the user message — the placeholder is
+# always paired with its user message, and the next render picks the work
+# back up. The user also sees a "Thinking…" cue immediately rather than a
+# 5-10 s blank wait.
+
 if query := st.chat_input("Ask about the labeled emails…"):
     st.session_state.chat_history.append({"role": "user", "content": query})
-    # Pre-filter records via the existing rule-based intent recognizer so
-    # the LLM (and the cards under the answer) get a focused subset rather
-    # than the full history every time. Cap at 30 records to keep prompts
-    # bounded.
-    summary, results = search_history(query, records)
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "content": "_Thinking…_",
+        "records": [],
+        "pending": True,
+    })
+    st.rerun()
+
+# Resolve any pending placeholder. We do this AFTER the replay loop above,
+# so the placeholder is visible to the user during the LLM round-trip.
+if (
+    st.session_state.chat_history
+    and st.session_state.chat_history[-1].get("pending")
+    and len(st.session_state.chat_history) >= 2
+):
+    user_q = st.session_state.chat_history[-2]["content"]
+    summary, results = search_history(user_q, records)
     candidates = results if results else records[:30]
     if llm.llm_available():
         try:
-            answer = llm.chat_about_history(query, candidates[:30])
+            answer = llm.chat_about_history(user_q, candidates[:30])
         except Exception as e:
             answer = (
                 f"_(LLM call failed — falling back to rule-based summary: "
@@ -465,7 +489,11 @@ if query := st.chat_input("Ask about the labeled emails…"):
             )
     else:
         answer = summary
-    st.session_state.chat_history.append({
-        "role": "assistant", "content": answer, "records": results,
-    })
+    if not (answer or "").strip():
+        answer = "_(empty response from the LLM — try rephrasing.)_"
+    st.session_state.chat_history[-1] = {
+        "role": "assistant",
+        "content": answer,
+        "records": results,
+    }
     st.rerun()
