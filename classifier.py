@@ -103,33 +103,31 @@ def classify_email(email: dict) -> list[str]:
     `scam_features` and `cv_match` blocks (used by history.jsonl + UI).
     Returns the label list — possibly empty.
 
-    Tries the LLM path first when OPENAI_API_KEY is set; on any LLM
-    failure (missing key, network error, parse error, schema mismatch)
-    silently falls back to the deterministic rule-based logic."""
-    # 1. Scam scorer (deterministic, runs in both paths).
+    When an LLM provider is configured, the LLM is the SOLE decider for
+    every label including Scam Risk. The deterministic scorer still
+    runs to populate `scam_features` for the dashboard and to give the
+    LLM heuristic evidence in its prompt, but it no longer gates the
+    decision. On LLM failure (missing provider, network, parse error)
+    the rule-based fallback re-introduces the deterministic scam gate
+    so the system still works without a key."""
+    # 1. Heuristic features (deterministic) — used as evidence the LLM
+    #    sees in its prompt, NOT as an early-exit gate. The LLM may
+    #    override the heuristic in either direction (label a high-score
+    #    email as legit, or flag a low-score email as Scam Risk based
+    #    on subtler cues the lexicon doesn't catch).
     email["scam_features"] = score_email_dict(email)
-    if (email["scam_features"].get("score") or 0) >= SCAM_THRESHOLD:
-        # Scam Risk is exclusive — never combine with topic labels.
-        # No need to run RAG / LLM for a clearly-scam email.
-        email["cv_match"] = {"score": 0.0, "matched": [], "missing_skills": []}
-        return ["Scam Risk"]
 
     # 2. RAG retrieval (deterministic). Always run so the dashboard +
     #    history.jsonl get the cv_match block, and so the LLM has
-    #    grounded evidence to reason from.
+    #    grounded evidence to reason from when assigning topic labels.
     body = email.get("body") or ""
     cv = cv_match_dict(body)
     email["cv_match"] = cv
 
-    # 3. Off-topic gate.
-    if (cv.get("score") or 0) < CV_MATCH_THRESHOLD:
-        return []
-
-    # 4. Try the LLM path first; fall back to the rule-based one on any
-    #    failure. Both paths see the same data (email + scam_features +
-    #    retrieved cv_match), and both honour the same rules — Scam Risk
-    #    exclusivity, off-topic returns [], multi-label is fine when the
-    #    email genuinely spans multiple topics.
+    # 3. LLM path — primary decider when configured. Sees the email +
+    #    scam_features + retrieved CV chunks + full CV + allowed-label
+    #    enum, and returns the label set (which may be ["Scam Risk"]
+    #    only, [], or one or more topic labels).
     if llm.llm_available():
         try:
             return llm.decide_labels(
@@ -138,6 +136,14 @@ def classify_email(email: dict) -> list[str]:
         except Exception as e:
             print(f"  [classifier] LLM path failed ({e}); falling back to rules.")
 
+    # 4. Rule-based fallback. Without an LLM we can't reason about
+    #    subtler cues, so fall back to the deterministic scam gate
+    #    (score >= SCAM_THRESHOLD → ["Scam Risk"] only) and then the
+    #    off-topic gate before the two-tier RAG voting.
+    if (email["scam_features"].get("score") or 0) >= SCAM_THRESHOLD:
+        return ["Scam Risk"]
+    if (cv.get("score") or 0) < CV_MATCH_THRESHOLD:
+        return []
     return _classify_rule_based(email)
 
 
