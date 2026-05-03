@@ -19,16 +19,21 @@ This project runs a small program in the background that:
 
   1. Watches your Gmail inbox every 2 minutes(or any cycle time u chose).
   2. Reads each new email's full body.
-  3. Decides if it's a scam (asks for "training fees", "deposits",
-     fake urgency).
-  4. Decides which of YOUR skills it matches (AI/ML, Research,
-     Software Engineering, Embedded Systems, DevOps).
+  3. Lets an LLM (Claude by default, OpenAI as a fallback) decide
+     whether it's an internship-shaped scam — asking for upfront
+     fees / deposits, no-interview / fast-track, urgency cues,
+     payment-to-receive-offer, etc. The LLM is the sole scam
+     judge; a deterministic heuristic still runs but only as
+     EVIDENCE in the LLM's prompt (not a gate).
+  4. The same LLM decides which of YOUR skills the email matches
+     (AI/ML, Research, Software Engineering, Embedded Systems,
+     DevOps), grounded in the top-k retrieved chunks from your CV.
   5. Adds Gmail labels automatically: "AI/ML", "Research", "Scam
      Risk", etc.
   6. Lets you see everything in a small web dashboard at
      http://localhost:8501 — cards with the email, why it got each
      label, plus a chat box where you can ask questions about your
-     past emails.
+     past emails (also LLM-backed when a provider is configured).
 
 The program is fully automatic once it's started. You only sign
 into Gmail manually, once per session.
@@ -52,10 +57,18 @@ WHAT YOU NEED BEFORE STARTING
                      session is reused after that.
   Disk space       : ~500 MB free (most of it is Playwright's
                      Chromium + the embedding model).
-  Optional         : an OpenAI API key, if you want the LLM-backed
-                     classifier path. The system runs end-to-end
-                     without one — see the "LLM mode" section
-                     below for details.
+  LLM provider     : ONE of the following activates the LLM path
+                     (which is the recommended path — the LLM is
+                     the sole scam judge here):
+                       (a) Claude Pro/Max subscription via the
+                           standalone `claude` CLI — recommended,
+                           no API-key billing. Set
+                           CLAUDE_CODE_OAUTH_TOKEN.
+                       (b) Anthropic API key (ANTHROPIC_API_KEY).
+                       (c) OpenAI API key (OPENAI_API_KEY).
+                     Without any of the above, the agent runs the
+                     deterministic rule-based fallback — see the
+                     "LLM mode" section below for details.
 
 
 ====================================================================
@@ -106,21 +119,39 @@ Step 4.  Download the Chromium binary that Playwright will drive.
   client-side code on disk.
 
 
-Step 5 (OPTIONAL).  Configure the LLM path.
+Step 5 (RECOMMENDED).  Configure the LLM path.
 
-  If you want the agent to call OpenAI for the labeling decision,
-  get a key from https://platform.openai.com/api-keys and set:
+  This is where scam detection becomes intelligent. With an LLM
+  configured, the model is the SOLE scam judge — it sees the full
+  email, the deterministic heuristic's findings (as evidence,
+  not as a verdict), the retrieved CV chunks, and decides every
+  label including Scam Risk. Without an LLM, the agent falls back
+  to the rule-based path and still runs end-to-end.
 
-    set OPENAI_API_KEY=sk-...your-key-here
+  Pick ONE of the three providers below — the agent picks the
+  first one whose env var is set, in this order:
 
-  Without this variable, the agent runs the deterministic
-  rule-based path instead and the system still works end-to-end.
-  The rule-based path is the default for grading runs.
+  (a) Claude Pro/Max subscription (recommended — no API billing)
+      Install the standalone Claude Code CLI:
+        winget install Anthropic.ClaudeCode
+      Generate a long-lived OAuth token:
+        claude setup-token
+      Persist it for future shells:
+        setx CLAUDE_CODE_OAUTH_TOKEN "sk-ant-oat01-..."
 
-  Cost note: gpt-4o-mini costs about $0.00025 per labeled email
-  (one call per email, 1500-token input, 30-token output). 1000
-  emails ≈ $0.25. Failures fall back silently to the rule-based
-  path so a missing or expired key cannot break the system.
+  (b) Direct Anthropic API (separate billing)
+        set ANTHROPIC_API_KEY=sk-ant-...
+
+  (c) OpenAI API
+        set OPENAI_API_KEY=sk-...
+
+  Cost note: the OpenAI path uses gpt-4o-mini (about $0.00025
+  per labeled email — 1500-token input, 30-token output, so 1000
+  emails ≈ $0.25). The Anthropic API path uses claude-haiku-4-5
+  by default. The Claude subscription path bills against your
+  Pro/Max plan (no per-call charge). Failures fall back silently
+  to the rule-based path so a missing or expired key cannot break
+  the system.
 
 
 Step 6.  Personalize the CV.
@@ -285,8 +316,13 @@ CARDS (one per email)
   CV. The full body is in an expander.
 
 CHAT PANEL (bottom of page)
-  Type a question. The chat searches history.jsonl and answers
-  using only what the agent actually wrote — no LLM call. Try:
+  Type a question. When an LLM provider is configured (Claude
+  subscription / Anthropic API / OpenAI), the chat is LLM-backed
+  — it gets the relevant slice of history.jsonl as grounded
+  context and answers in plain language. Without a provider, it
+  falls back to a rule-based grounded summary over keywords +
+  intent triggers (`why`, `scam`, `best`, label names, etc.).
+  Try:
     - "why was the latest scam labeled?"
     - "show me AI/ML emails"
     - "best CV match"
@@ -310,17 +346,33 @@ that calls three single-purpose modules each cycle:
     body, navigates back. Returns a list of email dicts.
 
   STEP 2 — classifier.py
-    For each email:
-      - Run scam_scorer.py (rule-based heuristic scoring).
-      - If scam score >= 0.5, emit ["Scam Risk"] only. Done.
+    LLM-first when a provider is configured. For each email:
+      - Run scam_scorer.py (rule-based heuristic scoring) —
+        EVIDENCE only when the LLM is on, not a gate.
       - Run cv_match.py: encode the body, cosine-compare against
         pre-encoded CV chunks, return the top-5 retrieved chunks
-        with their similarities and topic tags.
-      - If the best similarity is below 0.30, the email is
-        off-topic for your CV and gets no labels.
-      - Otherwise: try the LLM path (if OPENAI_API_KEY is set);
-        on any LLM failure, fall back to the rule-based path.
-    Both paths see the same data and follow the same rules.
+        with their similarities and topic tags. Always runs so
+        the LLM has grounded evidence and the dashboard can
+        show retrieval results.
+      - LLM path (primary). The LLM sees the email, the scam
+        heuristic's score and reasons, the retrieved CV chunks,
+        the candidate's full CV, and the allowed-labels enum.
+        It is the SOLE scam judge — it can flag scams the
+        lexicon missed (subtle social engineering) and clear
+        false positives where the lexicon misfired (a
+        legitimate paid internship that mentions a stipend).
+        Output is enum-constrained at the API level (forced
+        tool-use for Anthropic; response_format=json_schema
+        for OpenAI; strict-JSON instruction + post-validation
+        for the Claude CLI).
+      - Rule-based fallback (only when no LLM provider, or on
+        any LLM call failure):
+          * Scam gate: if heuristic score ≥ 0.5 → ["Scam Risk"].
+          * Off-topic gate: if best CV similarity < 0.30 → [].
+          * Otherwise two-tier RAG voting + body-keyword safety
+            net over the topic labels.
+    Either way, scam_features and cv_match are attached to the
+    email dict so the dashboard always shows the evidence.
 
   STEP 3 — apply_labels.py
     For each (thread_id, label) pair: tick the row's checkbox,
@@ -353,9 +405,14 @@ CODE
                      chunks, embeds with all-MiniLM-L6-v2, exposes
                      match(email_body) -> retrieved chunks +
                      similarities + missing skills.
-  llm.py             Optional OpenAI call with json_schema
-                     structured output. Used by classifier.py
-                     when OPENAI_API_KEY is set.
+  llm.py             LLM-backed label decider. Three providers,
+                     picked by env: claude_cli (Pro/Max
+                     subscription via the standalone `claude` CLI,
+                     no API billing) → anthropic (ANTHROPIC_API_KEY,
+                     forced tool-use enum) → openai (OPENAI_API_KEY,
+                     response_format=json_schema). Same RAG-grounded
+                     prompt across all three. Also powers the chat
+                     panel (chat_about_history) for free-form Q&A.
   streamlit_app.py   Dashboard with cards, sidebar Start/Stop,
                      auto-refresh, chat panel.
 
@@ -402,14 +459,23 @@ CHANGE THE CYCLE CADENCE
   e.g. --interval 5).
 
 USE A DIFFERENT LLM MODEL
-  Set the LLM_MODEL environment variable, e.g.:
-    set LLM_MODEL=gpt-4o
-  Default is gpt-4o-mini. Any OpenAI Chat Completions model that
-  supports json_schema response format will work.
+  - Anthropic API path: set ANTHROPIC_MODEL (default
+    claude-haiku-4-5-20251001). Any current Claude family model
+    works.
+  - OpenAI path: set OPENAI_MODEL (default gpt-4o-mini). Any
+    Chat Completions model that supports json_schema response
+    format will work.
+  - Claude subscription path: the `claude -p` CLI uses whichever
+    model your Pro/Max plan defaults to (Sonnet 4.6 today). No
+    knob to change it from this project.
 
 STOP USING THE LLM PATH
-  Unset OPENAI_API_KEY in your environment. The agent will fall
-  back to the rule-based classifier on its next cycle.
+  Unset every provider env var: CLAUDE_CODE_OAUTH_TOKEN,
+  ANTHROPIC_API_KEY, OPENAI_API_KEY. (You also need to log out
+  of the keychain — `claude auth logout` — if you used `claude
+  setup-token` before.) The agent will fall back to the
+  deterministic rule-based classifier on its next cycle, and
+  the dashboard caption will read "⚙️ Rule-based fallback".
 
 INSPECT WHY AN EMAIL GOT A LABEL
   In the dashboard chat panel, type:
@@ -488,10 +554,13 @@ Cards show "scam 0.0" and "cv-match 0.0" for everything.
      the labels in your Gmail sidebar and bulk-remove the
      incorrect ones.
 
-"OPENAI_API_KEY not set" or LLM-path 401/429 errors.
-  -> Either set the variable or remove it. Both cases trigger the
-     rule-based fallback automatically — the cycle still
-     completes, the log just notes the LLM call failed.
+No LLM provider key set, or LLM call returns 401/429/timeout.
+  -> Both cases trigger the rule-based fallback automatically —
+     the cycle still completes, the log just notes the LLM call
+     failed. The dashboard caption flips to "⚙️ Rule-based
+     fallback" when no provider is detected. To re-enable the
+     LLM path, set CLAUDE_CODE_OAUTH_TOKEN (subscription),
+     ANTHROPIC_API_KEY, or OPENAI_API_KEY and restart the agent.
 
 
 ====================================================================
@@ -513,10 +582,12 @@ LIMITATIONS / KNOWN ISSUES
 4. Labels added by the agent count toward Gmail's per-account
    label limit (10,000+). For typical use this is irrelevant.
 
-5. The chat panel's grounded search is keyword-based plus a few
-   intent rules — it's not an LLM. It will miss creative phrasings
-   that no rule maps onto. Future work would add an LLM path
-   here too, mirroring classifier.py.
+5. The chat panel's grounded search is LLM-backed when a
+   provider is configured (Claude / Anthropic / OpenAI) and
+   degrades to a keyword + intent-rule summary otherwise. The
+   LLM only sees a slice of history.jsonl as context (the top-30
+   filtered records), so questions about very old emails outside
+   that window may not be answered.
 
 6. Recency window can miss boundary cases.  Even with the 60-s
    safe zone, if the inbox scan happens at exactly the wrong

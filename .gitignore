@@ -19,6 +19,14 @@ history_*.jsonl.bak
 # user's Gmail address; never push.
 account_config.json
 
+# Local env files — keys go here when developers prefer python-dotenv
+# over `setx`. Never commit. The code reads CLAUDE_CODE_OAUTH_TOKEN /
+# ANTHROPIC_API_KEY / OPENAI_API_KEY from os.environ; nothing is ever
+# hard-coded.
+.env
+.env.*
+*.env
+
 # Agent process tracking — written by the dashboard's Start/Stop buttons
 agent.pid
 

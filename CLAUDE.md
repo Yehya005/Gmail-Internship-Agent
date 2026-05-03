@@ -52,7 +52,10 @@ llm.py             ← LLM-backed label decider. Provider preference:
 
 # UI
 streamlit_app.py   ← dashboard: per-email cards + sidebar Start/Stop + auto-
-                     refresh + chat panel grounded in history.jsonl. Header
+                     refresh + chat panel grounded in history.jsonl. The chat
+                     panel routes through llm.chat_about_history() (same
+                     provider as the classifier) when configured, and falls
+                     back to a keyword + intent-rule summary otherwise. Header
                      caption shows which classifier is live: 🧠 Claude (Pro
                      subscription) / 🧠 Claude (Anthropic API) / 🧠 GPT
                      (OpenAI) / ⚙️ Rule-based fallback.
@@ -258,7 +261,7 @@ Same flow as adding — click an already-checked `menuitemcheckbox` to toggle it
 
 ## Rubric status
 
-- ✅ **Custom LLM Agent.** `llm.py` calls Claude (subscription via standalone CLI by default; Anthropic / OpenAI APIs as alternatives) with the RAG-retrieved CV chunks as grounding and an enum-constrained label output. `classifier.py` routes through it whenever any provider key is set; falls back to rule-based on any error.
+- ✅ **Custom LLM Agent.** `llm.py` calls Claude (subscription via standalone CLI by default; Anthropic / OpenAI APIs as alternatives) with the RAG-retrieved CV chunks as grounding and an enum-constrained label output. The LLM is the **sole scam judge** in this path — `classifier.py` no longer short-circuits on the heuristic scam score; the deterministic features become EVIDENCE in the prompt and the model decides every label including Scam Risk. `classifier.py` routes through the LLM whenever any provider key is set; falls back to rule-based (with the original 0.5 scam gate) on any error.
 - ✅ **RAG with vector embeddings.** `cv_match.py` — sentence-transformers `all-MiniLM-L6-v2`, cosine retrieval, project chunks tagged with topics.
 - ✅ **3+ tools, ≥1 custom.** Gmail browser-automation (custom), `scam_scorer` (custom), `cv_match` RAG (uses HF Hub model), Claude / OpenAI API call from `llm.py` (external API).
 - ✅ **UI.** Streamlit dashboard with per-email cards, auto-refresh, sidebar Start/Stop, and a chat panel grounded in `history.jsonl`.
